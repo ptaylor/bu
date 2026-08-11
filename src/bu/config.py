@@ -1,26 +1,26 @@
 """Configuration loading and management for bu.
 
-Configuration is read from ~/.config/bu/config.toml (or $BU_CONFIG_PATH if set).
+Each destination is stored as a separate .toml file under the config directory.
+The default config directory is ~/.config/bu/ (or $BU_CONFIG_DIR if set).
 
-Example config.toml:
+Example layout:
 
-    [destinations.photos]
+    ~/.config/bu/
+    ├── photos.toml
+    ├── docs.toml
+    └── server.toml
+
+Example file (photos.toml):
+
     backend = "s3"
     source_paths = ["/home/user/photos"]
     bucket = "my-backups"
     region = "us-east-1"
 
-    [destinations.docs]
-    backend = "local"
-    source_paths = ["/home/user/docs"]
-    target_path = "/mnt/backup/docs"
-
-    [destinations.server]
-    backend = "rsync"
-    source_paths = ["/home/user/data"]
-    host = "backup.example.com"
-    user = "paul"
-    path = "/backups/data"
+Each destination gets a log file. The default location follows XDG state dirs:
+    ~/.local/state/bu/logs/<name>.log
+Override per-destination with the optional ``log_file`` key, or set the
+``BU_LOG_DIR`` environment variable to change the base log directory.
 """
 
 from __future__ import annotations
@@ -40,6 +40,25 @@ class ConfigError(Exception):
     """Raised when configuration is invalid or missing."""
 
 
+# Keys that are handled specially and NOT passed through to backend ``extra``.
+_RESERVED_KEYS = frozenset({"backend", "source_paths", "log_file"})
+
+
+def _default_log_dir() -> Path:
+    """Return the default base directory for log files.
+
+    Uses $BU_LOG_DIR if set, otherwise $XDG_STATE_HOME/bu/logs,
+    falling back to ~/.local/state/bu/logs.
+    """
+    if env_dir := os.environ.get("BU_LOG_DIR"):
+        return Path(env_dir)
+    xdg_state = os.environ.get(
+        "XDG_STATE_HOME",
+        os.path.expanduser("~/.local/state"),
+    )
+    return Path(xdg_state) / "bu" / "logs"
+
+
 class DestinationConfig:
     """Holds the parsed configuration for a single backup destination."""
 
@@ -47,69 +66,93 @@ class DestinationConfig:
         self.name = name
         self.backend: str = data.get("backend", "")
         self.source_paths: list[str] = data.get("source_paths", [])
+        self._log_file_override: str | None = data.get("log_file")
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
-            if k not in ("backend", "source_paths")
+            if k not in _RESERVED_KEYS
         }
+
+    @property
+    def log_file(self) -> Path:
+        """Return the resolved log file path for this destination.
+
+        If ``log_file`` is set in the config, that path is used as-is.
+        Otherwise the default is ``<log-dir>/<name>.log`` where the log
+        directory is controlled by $BU_LOG_DIR (default ~/.local/state/bu/logs).
+        """
+        if self._log_file_override:
+            return Path(self._log_file_override).expanduser()
+        return _default_log_dir() / f"{self.name}.log"
 
     def __repr__(self) -> str:
         return f"DestinationConfig(name={self.name!r}, backend={self.backend!r})"
 
 
 class Config:
-    """Represents the full bu configuration."""
+    """Represents the full bu configuration — a directory of .toml files.
 
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = path or self._default_path()
+    Each .toml file in the config directory represents one destination.
+    The filename (minus .toml) is the destination name.
+    """
+
+    def __init__(self, config_dir: Path | None = None) -> None:
+        self.config_dir = config_dir or self._default_dir()
         self.destinations: dict[str, DestinationConfig] = {}
-        self._raw: dict[str, Any] = {}
 
-        if self.path.exists():
+        if self.config_dir.exists():
             self._load()
 
     @staticmethod
-    def _default_path() -> Path:
-        """Return the default config file path.
+    def _default_dir() -> Path:
+        """Return the default config directory path.
 
-        Uses $BU_CONFIG_PATH if set, otherwise ~/.config/bu/config.toml.
+        Uses $BU_CONFIG_DIR if set, otherwise ~/.config/bu/.
         """
-        if env_path := os.environ.get("BU_CONFIG_PATH"):
-            return Path(env_path)
-        # XDG_CONFIG_HOME or ~/.config
+        if env_dir := os.environ.get("BU_CONFIG_DIR"):
+            return Path(env_dir)
         xdg = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
-        return Path(xdg) / "bu" / "config.toml"
+        return Path(xdg) / "bu"
 
     def _load(self) -> None:
-        """Parse the TOML config file."""
-        try:
-            with open(self.path, "rb") as f:
-                self._raw = tomllib.load(f)
-        except tomllib.TOMLDecodeError as e:
-            raise ConfigError(f"Invalid TOML in {self.path}: {e}") from e
-        except OSError as e:
-            raise ConfigError(f"Cannot read {self.path}: {e}") from e
+        """Scan the config directory for *.toml files and parse each one."""
+        if not self.config_dir.is_dir():
+            raise ConfigError(f"Config path is not a directory: {self.config_dir}")
 
-        # Parse [destinations] section
-        dests = self._raw.get("destinations", {})
-        if not dests:
-            raise ConfigError(f"No [destinations] defined in {self.path}")
+        toml_files = sorted(self.config_dir.glob("*.toml"))
+        if not toml_files:
+            return  # No destinations configured yet — not an error
 
-        for name, data in dests.items():
+        errors: list[str] = []
+        for fp in toml_files:
+            name = fp.stem  # filename without .toml
+            try:
+                with open(fp, "rb") as f:
+                    data = tomllib.load(f)
+            except tomllib.TOMLDecodeError as e:
+                errors.append(f"{fp.name}: invalid TOML — {e}")
+                continue
+            except OSError as e:
+                errors.append(f"{fp.name}: cannot read — {e}")
+                continue
+
             if not isinstance(data, dict):
-                raise ConfigError(
-                    f"Destination [{name!r}] must be a table in {self.path}"
-                )
+                errors.append(f"{fp.name}: must contain key-value pairs")
+                continue
+
             backend = data.get("backend", "")
             if not backend:
-                raise ConfigError(
-                    f"Destination [{name!r}] is missing required 'backend' key"
-                )
+                errors.append(f"{fp.name}: missing required 'backend' key")
+                continue
+
             source_paths = data.get("source_paths", [])
             if not source_paths:
-                raise ConfigError(
-                    f"Destination [{name!r}] is missing required 'source_paths'"
-                )
+                errors.append(f"{fp.name}: missing required 'source_paths'")
+                continue
+
             self.destinations[name] = DestinationConfig(name, data)
+
+        if errors:
+            raise ConfigError("\n".join(errors))
 
     def get(self, name: str) -> DestinationConfig:
         """Return configuration for a named destination.
@@ -127,3 +170,8 @@ class Config:
     def list_destinations(self) -> list[str]:
         """Return a sorted list of configured destination names."""
         return sorted(self.destinations.keys())
+
+    def destination_path(self, name: str) -> Path:
+        """Return the expected .toml file path for a destination name."""
+        return self.config_dir / f"{name}.toml"
+

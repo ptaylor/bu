@@ -9,6 +9,8 @@ Actions:
     check     Show what files would be backed up
     verify    Verify integrity of backed-up data
     status    Show status of the backup destination
+    config    Edit the configuration file in $EDITOR
+    history   Show action history for a destination
 """
 
 from __future__ import annotations
@@ -23,12 +25,15 @@ from bu import __version__
 from bu.actions import (
     action_backup,
     action_check,
+    action_config,
+    action_history,
     action_restore,
     action_status,
     action_verify,
+    format_history,
     format_result,
 )
-from bu.config import Config, ConfigError
+from bu.config import Config, ConfigError, DestinationConfig
 
 
 class OrderedGroup(click.Group):
@@ -42,16 +47,30 @@ class OrderedGroup(click.Group):
 _DRY_RUN = click.option("--dry-run", "-n", is_flag=True, help="Show what would be done without making changes.")
 _JSON = click.option("--json", "json_output", is_flag=True, help="Output results as JSON.")
 _CONFIG = click.option(
-    "--config", "-c", "config_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    help="Path to config file (default: ~/.config/bu/config.toml).",
+    "--config", "-c", "config_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Path to config directory (default: ~/.config/bu/).",
+)
+_CONFIG_OPTIONAL = click.option(
+    "--config", "-c", "config_dir", type=click.Path(file_okay=False, path_type=Path),
+    help="Path to config directory (default: ~/.config/bu/).",
 )
 _DEST_ARG = click.argument("destination", metavar="<DESTINATION>")
 
 
-def _load_config(config_path: Path | None) -> Config:
+def _load_config(config_dir: Path | None) -> Config:
     """Load configuration, printing a friendly error and exiting on failure."""
     try:
-        return Config(config_path)
+        return Config(config_dir)
+    except ConfigError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+def _resolve_destination(config_dir: Path | None, destination: str) -> DestinationConfig:
+    """Load config and resolve a destination, with a friendly error on failure."""
+    cfg = _load_config(config_dir)
+    try:
+        return cfg.get(destination)
     except ConfigError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -74,9 +93,9 @@ def main(ctx: click.Context) -> None:
             if dests:
                 click.echo(f"\nConfigured destinations: {', '.join(dests)}")
             else:
-                click.echo("\nNo destinations configured. Create ~/.config/bu/config.toml")
+                click.echo("\nNo destinations configured. Run 'bu config <name> --backend <type>' to create one.")
         except ConfigError:
-            click.echo("\nNo config file found. Create ~/.config/bu/config.toml")
+            click.echo("\nNo config directory found. Run 'bu config <name> --backend <type>' to get started.")
 
 
 @main.command()
@@ -86,15 +105,14 @@ def main(ctx: click.Context) -> None:
 @_DEST_ARG
 @click.option("--source", "-s", "sources", multiple=True, help="Override source paths (can be repeated).")
 def backup(
-    config_path: Path | None,
+    config_dir: Path | None,
     dry_run: bool,
     json_output: bool,
     destination: str,
     sources: tuple[str, ...],
 ) -> None:
     """Back up source paths to DESTINATION."""
-    cfg = _load_config(config_path)
-    dest = cfg.get(destination)
+    dest = _resolve_destination(config_dir, destination)
 
     extra_args: dict[str, Any] = {}
     if sources:
@@ -115,15 +133,14 @@ def backup(
 @_DEST_ARG
 @click.option("--to", "-t", "restore_path", required=True, help="Local path to restore files to.")
 def restore(
-    config_path: Path | None,
+    config_dir: Path | None,
     dry_run: bool,
     json_output: bool,
     destination: str,
     restore_path: str,
 ) -> None:
     """Restore data from DESTINATION to a local path."""
-    cfg = _load_config(config_path)
-    dest = cfg.get(destination)
+    dest = _resolve_destination(config_dir, destination)
 
     result = action_restore(dest, restore_path, dry_run=dry_run)
     click.echo(format_result(result, json_output=json_output))
@@ -138,14 +155,13 @@ def restore(
 @_DEST_ARG
 @click.option("--source", "-s", "sources", multiple=True, help="Override source paths (can be repeated).")
 def check(
-    config_path: Path | None,
+    config_dir: Path | None,
     json_output: bool,
     destination: str,
     sources: tuple[str, ...],
 ) -> None:
     """Check what files would be backed up to DESTINATION."""
-    cfg = _load_config(config_path)
-    dest = cfg.get(destination)
+    dest = _resolve_destination(config_dir, destination)
 
     extra_args: dict[str, Any] = {}
     if sources:
@@ -161,14 +177,13 @@ def check(
 @_DEST_ARG
 @click.option("--full", is_flag=True, help="Perform full checksum verification.")
 def verify(
-    config_path: Path | None,
+    config_dir: Path | None,
     json_output: bool,
     destination: str,
     full: bool,
 ) -> None:
     """Verify integrity of backed-up data at DESTINATION."""
-    cfg = _load_config(config_path)
-    dest = cfg.get(destination)
+    dest = _resolve_destination(config_dir, destination)
 
     result = action_verify(dest, full=full)
     click.echo(format_result(result, json_output=json_output))
@@ -182,13 +197,63 @@ def verify(
 @_JSON
 @_DEST_ARG
 def status(
-    config_path: Path | None,
+    config_dir: Path | None,
     json_output: bool,
     destination: str,
 ) -> None:
     """Show status of the backup at DESTINATION."""
-    cfg = _load_config(config_path)
-    dest = cfg.get(destination)
+    dest = _resolve_destination(config_dir, destination)
 
     result = action_status(dest)
     click.echo(format_result(result, json_output=json_output))
+
+
+@main.command()
+@_CONFIG_OPTIONAL
+@_JSON
+@click.argument("destination", metavar="<DESTINATION>", required=False, default=None)
+@click.option(
+    "--backend", "-b", "backend",
+    type=click.Choice(["local", "s3", "rsync"]),
+    help="Backend type for the sample template when creating a new destination.",
+)
+def config(
+    config_dir: Path | None,
+    json_output: bool,
+    destination: str | None,
+    backend: str | None,
+) -> None:
+    """Edit a destination configuration in $EDITOR.
+
+    If <DESTINATION> is given, opens (or creates) its .toml file.
+    Use --backend to get a tailored sample template for new destinations.
+    Without <DESTINATION>, lists all configured destinations.
+    """
+    result = action_config(config_dir, destination=destination, backend=backend)
+    click.echo(format_result(result, json_output=json_output))
+
+    if not result.get("ok"):
+        sys.exit(1)
+
+
+@main.command()
+@_CONFIG
+@_JSON
+@_DEST_ARG
+@click.option("--limit", "-n", type=int, default=0, help="Show only the last N actions.")
+def history(
+    config_dir: Path | None,
+    json_output: bool,
+    destination: str,
+    limit: int,
+) -> None:
+    """Show the action history for DESTINATION.
+
+    Displays backup and restore actions in reverse chronological order
+    (latest first). Each action shows start/end timestamps, file/size
+    stats, and any errors or notes recorded during the run.
+    """
+    dest = _resolve_destination(config_dir, destination)
+
+    result = action_history(dest, limit=limit)
+    click.echo(format_history(result, json_output=json_output))
