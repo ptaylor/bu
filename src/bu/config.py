@@ -16,10 +16,14 @@ Example file (photos.toml):
     source_paths = ["/home/user/photos"]
     destination = "/mnt/backup/photos"
 
-Each destination gets a log file. The default location follows XDG state dirs:
-    ~/.local/state/bu/logs/<name>.log
-Override per-destination with the optional ``log_file`` key, or set the
-``BU_LOG_DIR`` environment variable to change the base log directory.
+Each destination gets two tracking files under the XDG state directory
+(~/.local/state/bu/):
+
+    history/<name>.json   — structured JSON-lines action history
+    logs/<name>.log       — raw execution output per run
+
+Override with the optional ``history_file`` and ``log_file`` keys, or set
+``BU_LOG_DIR`` to change the base log directory.
 """
 
 from __future__ import annotations
@@ -40,25 +44,34 @@ class ConfigError(Exception):
 
 
 # Keys that are handled specially and NOT passed through to backend ``extra``.
-_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "log_file"})
+_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file"})
 
 # Valid method names.
 _VALID_METHODS = frozenset({"rsync", "duplicity"})
 
 
-def _default_log_dir() -> Path:
-    """Return the default base directory for log files.
-
-    Uses $BU_LOG_DIR if set, otherwise $XDG_STATE_HOME/bu/logs,
-    falling back to ~/.local/state/bu/logs.
-    """
-    if env_dir := os.environ.get("BU_LOG_DIR"):
-        return Path(env_dir)
+def _default_state_dir() -> Path:
+    """Return ``$XDG_STATE_HOME/bu`` (default ~/.local/state/bu)."""
     xdg_state = os.environ.get(
         "XDG_STATE_HOME",
         os.path.expanduser("~/.local/state"),
     )
-    return Path(xdg_state) / "bu" / "logs"
+    return Path(xdg_state) / "bu"
+
+
+def _default_history_dir() -> Path:
+    """Return the default directory for structured history files."""
+    return _default_state_dir() / "history"
+
+
+def _default_raw_log_dir() -> Path:
+    """Return the default directory for raw execution log files.
+
+    Uses $BU_LOG_DIR if set, otherwise ``<state>/logs``.
+    """
+    if env_dir := os.environ.get("BU_LOG_DIR"):
+        return Path(env_dir)
+    return _default_state_dir() / "logs"
 
 
 class DestinationConfig:
@@ -69,6 +82,7 @@ class DestinationConfig:
         self.method: str = data.get("method", "")
         self.source_paths: list[str] = data.get("source_paths", [])
         self.destination: str = data.get("destination", "")
+        self._history_file_override: str | None = data.get("history_file")
         self._log_file_override: str | None = data.get("log_file")
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
@@ -76,16 +90,24 @@ class DestinationConfig:
         }
 
     @property
-    def log_file(self) -> Path:
-        """Return the resolved log file path for this destination.
+    def history_file(self) -> Path:
+        """Resolved path for structured JSON-lines action history.
 
-        If ``log_file`` is set in the config, that path is used as-is.
-        Otherwise the default is ``<log-dir>/<name>.log`` where the log
-        directory is controlled by $BU_LOG_DIR (default ~/.local/state/bu/logs).
+        Default: ``~/.local/state/bu/history/<name>.json``.
+        """
+        if self._history_file_override:
+            return Path(self._history_file_override).expanduser()
+        return _default_history_dir() / f"{self.name}.json"
+
+    @property
+    def log_file(self) -> Path:
+        """Resolved path for raw execution logs.
+
+        Default: ``~/.local/state/bu/logs/<name>.log``.
         """
         if self._log_file_override:
             return Path(self._log_file_override).expanduser()
-        return _default_log_dir() / f"{self.name}.log"
+        return _default_raw_log_dir() / f"{self.name}.log"
 
     def __repr__(self) -> str:
         return f"DestinationConfig(name={self.name!r}, method={self.method!r})"

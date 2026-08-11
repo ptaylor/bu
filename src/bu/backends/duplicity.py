@@ -26,14 +26,13 @@ class DuplicityMethod(Backend):
     def backup(self, source_paths, *, dry_run=False, extra_args=None):
         return self._stub()
 
-    def restore(self, restore_path, *, dry_run=False, extra_args=None):
-        return {"files_restored": 0, "bytes_restored": 0, "errors": ["duplicity method is not yet implemented"]}
-
-    def check(self, source_paths, *, extra_args=None):
-        return {"files_to_backup": 0, "files_to_update": 0, "total_size": 0, "errors": ["duplicity method is not yet implemented"]}
-
-    def verify(self, source_paths, *, full=False, extra_args=None):
-        return {"verified": 0, "missing": [], "mismatched": [], "errors": ["duplicity method is not yet implemented"]}
-
     def status(self, *, extra_args=None):
-        return {"exists": False, "file_count": 0, "total_size": 0, "last_backup": None}
+        return {
+            "destination": self.config.get("_name", "unknown"),
+            "method": "duplicity",
+            "config_ok": True,
+            "source_paths": self.config.get("_source_paths", []),
+            "dest_path": self.config.get("destination", ""),
+            "dest_exists": False,
+            "last_backup": None,
+        }

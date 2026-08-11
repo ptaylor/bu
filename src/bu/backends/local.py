@@ -14,7 +14,6 @@ import datetime
 import json
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -70,11 +69,24 @@ class RsyncMethod(Backend):
         """Check that every source path is a directory.  Returns error list."""
         errors: list[str] = []
         for sp in source_paths:
-            p = Path(sp).expanduser().resolve()
-            if not p.exists():
-                errors.append(f"Source not found: {p}")
-            elif not p.is_dir():
-                errors.append(f"Source must be a directory (not a file): {p}")
+            display = Path(sp).expanduser()
+            real = display.resolve()
+            if not real.exists():
+                errors.append(f"Source not found: {display}")
+            elif not real.is_dir():
+                errors.append(f"Source must be a directory (not a file): {display}")
+        return errors
+
+    def _validate_destination(self) -> list[str]:
+        """Check that the destination base path exists and is writable."""
+        errors: list[str] = []
+        base = Path(self.config.get("destination", "")).expanduser()
+        if not base.exists():
+            errors.append(f"Destination not found: {base}")
+        elif not base.is_dir():
+            errors.append(f"Destination is not a directory: {base}")
+        elif not os.access(base, os.W_OK):
+            errors.append(f"Destination not writable: {base}")
         return errors
 
     # ------------------------------------------------------------------
@@ -93,6 +105,11 @@ class RsyncMethod(Backend):
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}
 
+        # Validate destination base path is usable
+        dest_errors = self._validate_destination()
+        if dest_errors:
+            return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": dest_errors}
+
         dest = self._dest_dir()
 
         if not dry_run:
@@ -101,6 +118,8 @@ class RsyncMethod(Backend):
         total_files = 0
         total_bytes = 0
         all_errors: list[str] = []
+        all_stdout: list[str] = []
+        all_stderr: list[str] = []
 
         for src_str in source_paths:
             src = Path(src_str).expanduser().resolve()
@@ -108,6 +127,8 @@ class RsyncMethod(Backend):
             total_files += result["files"]
             total_bytes += result["bytes"]
             all_errors.extend(result["errors"])
+            all_stdout.append(result.get("stdout", ""))
+            all_stderr.append(result.get("stderr", ""))
 
         if not dry_run:
             if all_errors:
@@ -129,12 +150,26 @@ class RsyncMethod(Backend):
             "files_skipped": 0,
             "bytes_copied": total_bytes,
             "errors": all_errors,
+            "stdout": "\n".join(all_stdout).strip(),
+            "stderr": "\n".join(all_stderr).strip(),
+            "rsync_version": self._rsync_version(),
         }
+
+    def _rsync_version(self) -> str:
+        """Return the rsync version string, or empty on failure."""
+        try:
+            proc = subprocess.run(
+                ["rsync", "--version"], capture_output=True, text=True, check=False,
+            )
+            # First line is typically "rsync  version 3.x.x  ..."
+            return proc.stdout.split("\n")[0].strip()
+        except (FileNotFoundError, OSError):
+            return ""
 
     def _rsync_one(self, src: Path, dest: Path, dry_run: bool) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
-        Returns ``{files, bytes, errors}``.
+        Returns ``{files, bytes, errors, stdout, stderr}``.
         """
         # Ensure dest parent exists (rsync can create the leaf)
         if not dry_run:
@@ -173,140 +208,14 @@ class RsyncMethod(Backend):
         except ValueError:
             bytes_transferred = 0
 
-        return {"files": files, "bytes": bytes_transferred, "errors": errors}
+        return {"files": files, "bytes": bytes_transferred, "errors": errors,
+                "stdout": proc.stdout, "stderr": proc.stderr}
 
     @staticmethod
     def _parse_rsync_stat(output: str, pattern: str) -> str:
         """Extract the first capture group from an rsync --stats line."""
         m = re.search(pattern, output, re.IGNORECASE)
         return m.group(1).replace(",", "") if m else ""
-
-    @staticmethod
-    def _parse_human_size(raw: str) -> int:
-        """Parse a human-readable size string like '1.23K' or '4.5M' into bytes."""
-        raw = raw.strip().upper().replace(",", "")
-        if not raw:
-            return 0
-        try:
-            return int(float(raw))
-        except ValueError:
-            pass
-
-        multipliers = {"B": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-        for suffix, mult in multipliers.items():
-            if raw.endswith(suffix):
-                try:
-                    return int(float(raw[:-1]) * mult)
-                except ValueError:
-                    return 0
-        # Plain number (no suffix) — treat as bytes
-        try:
-            return int(float(raw))
-        except ValueError:
-            return 0
-
-    # ------------------------------------------------------------------
-    # remaining actions — unchanged for now
-    # ------------------------------------------------------------------
-
-    def restore(
-        self,
-        restore_path: str,
-        *,
-        dry_run: bool = False,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        dest = self._dest_dir()
-        restore = Path(restore_path).expanduser().resolve()
-
-        if not dest.exists():
-            return {"files_restored": 0, "bytes_restored": 0, "errors": [f"Backup source not found: {dest}"]}
-
-        result = self._copy_tree(dest, restore, dry_run)
-        return {
-            "files_restored": result["copied"],
-            "files_skipped": result["skipped"],
-            "bytes_restored": result["bytes"],
-            "errors": result["errors"],
-        }
-
-    def check(
-        self,
-        source_paths: list[str],
-        *,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        dest = self._dest_dir()
-        to_backup: list[str] = []
-        to_update: list[str] = []
-        total_size = 0
-
-        for src_str in source_paths:
-            src = Path(src_str).expanduser().resolve()
-            if not src.exists() or not src.is_dir():
-                continue
-
-            for root, _, files in os.walk(src):
-                for fname in files:
-                    sf = Path(root) / fname
-                    rel = sf.relative_to(src)
-                    df = dest / src.name / rel
-                    need, size = self._needs_copy(sf, df)
-                    if need:
-                        to_backup.append(str(sf))
-                        total_size += size
-                    elif df.exists():
-                        to_update.append(str(sf))
-
-        return {
-            "files_to_backup": len(to_backup),
-            "files_to_update": len(to_update),
-            "total_size": total_size,
-            "files": to_backup,
-        }
-
-    def verify(
-        self,
-        source_paths: list[str],
-        *,
-        full: bool = False,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        dest = self._dest_dir()
-        verified = 0
-        missing: list[str] = []
-        mismatched: list[str] = []
-        errors: list[str] = []
-
-        for src_str in source_paths:
-            src = Path(src_str).expanduser().resolve()
-            if not src.exists():
-                missing.append(str(src))
-                continue
-
-            if src.is_dir():
-                for root, _, files in os.walk(src):
-                    for fname in files:
-                        sf = Path(root) / fname
-                        rel = sf.relative_to(src)
-                        df = dest / src.name / rel
-                        if not df.exists():
-                            missing.append(str(sf))
-                        elif full:
-                            import filecmp
-                            if not filecmp.cmp(sf, df, shallow=False):
-                                mismatched.append(str(sf))
-                            else:
-                                verified += 1
-                        else:
-                            verified += 1
-
-        return {
-            "verified": verified,
-            "missing": missing,
-            "mismatched": mismatched,
-            "errors": errors,
-        }
 
     def status(
         self,
@@ -330,6 +239,16 @@ class RsyncMethod(Backend):
             "dest_exists": dest_dir.is_dir(),
         }
 
+        # Check existence of each source path
+        sources_status: list[dict[str, Any]] = []
+        for sp in source_paths:
+            p = Path(sp).expanduser()
+            sources_status.append({
+                "path": str(p),
+                "exists": p.is_dir(),
+            })
+        result["sources"] = sources_status
+
         # Read bu-status.json if it exists
         sp = self._status_path()
         if sp.exists():
@@ -344,53 +263,4 @@ class RsyncMethod(Backend):
 
         return result
 
-    # --- helpers ---
-
-    @staticmethod
-    def _needs_copy(src: Path, dest: Path) -> tuple[bool, int]:
-        """Return (needs_copy, size_bytes) for a single file."""
-        size = src.stat().st_size
-        if not dest.exists():
-            return True, size
-        if src.stat().st_mtime > dest.stat().st_mtime:
-            return True, size
-        if src.stat().st_size != dest.stat().st_size:
-            return True, size
-        return False, size
-
-    @staticmethod
-    def _copy_file(src: Path, dest: Path, dry_run: bool) -> dict[str, Any]:
-        """Copy a single file. Returns stats dict."""
-        need, size = RsyncMethod._needs_copy(src, dest)
-        if not need:
-            return {"copied": 0, "skipped": 1, "bytes": 0, "errors": []}
-
-        if not dry_run:
-            try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest)
-            except OSError as e:
-                return {"copied": 0, "skipped": 0, "bytes": 0, "errors": [str(e)]}
-
-        return {"copied": 1, "skipped": 0, "bytes": size, "errors": []}
-
-    @staticmethod
-    def _copy_tree(src: Path, dest: Path, dry_run: bool) -> dict[str, Any]:
-        """Copy a directory tree. Returns stats dict."""
-        copied = 0
-        skipped = 0
-        total_bytes = 0
-        errors: list[str] = []
-
-        for root, _, files in os.walk(src):
-            for fname in files:
-                sf = Path(root) / fname
-                rel = sf.relative_to(src)
-                df = dest / rel
-                result = RsyncMethod._copy_file(sf, df, dry_run)
-                copied += result["copied"]
-                skipped += result["skipped"]
-                total_bytes += result["bytes"]
-                errors.extend(result["errors"])
-
-        return {"copied": copied, "skipped": skipped, "bytes": total_bytes, "errors": errors}
+    # --- helpers (only _parse_rsync_stat retained for backup) ---

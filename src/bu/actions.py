@@ -1,7 +1,7 @@
-"""Action handlers for bu — backup, restore, check, verify, status, config.
+"""Action handlers for bu — backup, status, config, history.
 
 Each action receives a DestinationConfig and optional extra args, then delegates
-to the appropriate backend implementation.
+to the appropriate method implementation.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ _SAMPLE_RSYNC = """\
 method = "rsync"
 source_paths = ["~/Documents", "~/notes"]
 destination = "/mnt/backup/docs"
+{history_file}
 {log_file}
 """
 
@@ -37,6 +38,7 @@ _SAMPLE_DUPLICITY = """\
 method = "duplicity"
 source_paths = ["~/Documents", "~/notes"]
 destination = "/mnt/backup/docs"
+{history_file}
 {log_file}
 """
 
@@ -45,6 +47,7 @@ _SAMPLE_GENERIC = """\
 # method = "rsync"   # or "duplicity"
 # source_paths = ["/path/to/backup"]
 # destination = "/path/to/backup/location"
+{history_file}
 {log_file}
 """
 
@@ -67,7 +70,9 @@ def action_backup(
     extra_args: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run a backup to the configured destination."""
-    logger = ActionLogger(dest.log_file)
+    start_ts = datetime.datetime.now(datetime.timezone.utc)
+
+    logger = ActionLogger(dest.history_file)
     logger.start("backup", dest.name)
 
     backend = _build_backend(dest)
@@ -83,53 +88,71 @@ def action_backup(
         bytes_copied=result.get("bytes_copied", 0),
         dry_run=dry_run,
     )
+
+    # Write raw execution log
+    _write_raw_log(dest, "backup", start_ts, result)
+
     return result
 
 
-def action_restore(
+def _write_raw_log(
     dest: DestinationConfig,
-    restore_path: str,
-    *,
-    dry_run: bool = False,
-    extra_args: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Restore data from the configured destination."""
-    logger = ActionLogger(dest.log_file)
-    logger.start("restore", dest.name)
+    action: str,
+    start_ts: datetime.datetime,
+    result: dict[str, Any],
+) -> None:
+    """Append a raw execution log entry to the destination's log file."""
+    end_ts = datetime.datetime.now(datetime.timezone.utc)
+    log_path = dest.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    backend = _build_backend(dest)
-    result = backend.restore(restore_path, dry_run=dry_run, extra_args=extra_args)
+    lines: list[str] = []
+    lines.append(f"{'='*60}")
+    lines.append(f"Action      : {action}")
+    lines.append(f"Destination : {dest.name}")
+    lines.append(f"Method      : {dest.method}")
+    lines.append(f"Started     : {start_ts.isoformat()}")
+    lines.append(f"Ended       : {end_ts.isoformat()}")
+    lines.append(f"Source paths:")
+    for sp in dest.source_paths:
+        lines.append(f"  {sp}")
+    lines.append(f"Dest path   : {dest.destination}")
+    lines.append(f"Dry run     : {result.get('dry_run', False)}")
 
-    for err in result.get("errors", []):
-        logger.error(str(err))
+    # Rsync version (only present for rsync method)
+    version = result.get("rsync_version", "")
+    if version:
+        lines.append(f"Rsync ver   : {version}")
 
-    logger.end(
-        files_restored=result.get("files_restored", 0),
-        bytes_restored=result.get("bytes_restored", 0),
-        dry_run=dry_run,
-    )
-    return result
+    # Stats
+    for label, key in [("Files copied", "files_copied"), ("Files restored", "files_restored"),
+                        ("Bytes copied", "bytes_copied"), ("Bytes restored", "bytes_restored")]:
+        if key in result:
+            lines.append(f"{label:12s} {result[key]}")
 
+    errors = result.get("errors", [])
+    if errors:
+        lines.append(f"Errors      : {len(errors)}")
+        for err in errors:
+            lines.append(f"  {err}")
 
-def action_check(
-    dest: DestinationConfig,
-    *,
-    extra_args: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Check what would be backed up."""
-    backend = _build_backend(dest)
-    return backend.check(dest.source_paths, extra_args=extra_args)
+    # Raw stdout from the backend
+    stdout = result.get("stdout", "")
+    if stdout:
+        lines.append(f"{'-'*40}")
+        lines.append("--- command output ---")
+        lines.append(stdout)
 
+    stderr = result.get("stderr", "")
+    if stderr:
+        lines.append(f"{'-'*40}")
+        lines.append("--- stderr ---")
+        lines.append(stderr)
 
-def action_verify(
-    dest: DestinationConfig,
-    *,
-    full: bool = False,
-    extra_args: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Verify integrity of backed-up data."""
-    backend = _build_backend(dest)
-    return backend.verify(dest.source_paths, full=full, extra_args=extra_args)
+    lines.append("")
+
+    with open(log_path, "a") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def action_status(
@@ -153,10 +176,15 @@ def _default_config_dir() -> Path:
 def _sample_for_method(method: str, destination: str) -> str:
     """Return a sample config template for the given method type.
 
-    The ``log_file`` key is pre-filled with the default computed path.
+    Both ``history_file`` and ``log_file`` are pre-filled with their
+    default computed paths.
     """
-    from bu.config import _default_log_dir
-    log_path = _default_log_dir() / f"{destination}.log"
+    from bu.config import _default_history_dir, _default_raw_log_dir
+
+    history_path = _default_history_dir() / f"{destination}.json"
+    history_line = f'history_file = "{history_path}"'
+
+    log_path = _default_raw_log_dir() / f"{destination}.log"
     log_line = f'log_file = "{log_path}"'
 
     samples: dict[str, str] = {
@@ -164,7 +192,7 @@ def _sample_for_method(method: str, destination: str) -> str:
         "duplicity": _SAMPLE_DUPLICITY,
     }
     template = samples.get(method, _SAMPLE_GENERIC)
-    return template.format(log_file=log_line)
+    return template.format(history_file=history_line, log_file=log_line)
 
 
 def action_config(
@@ -342,7 +370,7 @@ def action_history(
     limit : int
         Maximum number of action groups to return. 0 means no limit.
     """
-    entries = read_log(dest.log_file)
+    entries = read_log(dest.history_file)
     groups = group_entries(entries)
 
     # Build a summary for each correlation_id group
@@ -395,7 +423,7 @@ def action_history(
 
     return {
         "destination": dest.name,
-        "log_file": str(dest.log_file),
+        "history_file": str(dest.history_file),
         "total_actions": len(summaries),
         "history": summaries,
     }
@@ -428,7 +456,7 @@ def format_history(result: dict[str, Any], json_output: bool = False) -> str:
 
     history = result.get("history", [])
     if not history:
-        return f"No action history for '{result.get('destination', '?')}'.\nLog: {result.get('log_file', '?')}"
+        return f"No action history for '{result.get('destination', '?')}'.\nLog: {result.get('history_file', '?')}"
 
     lines: list[str] = []
     for h in history:
@@ -472,8 +500,13 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
     if json_output:
         return json.dumps(result, indent=2, default=str)
 
+    # Internal keys not meant for display
+    _skip = {"stdout", "stderr", "rsync_version", "dry_run"}
+
     lines: list[str] = []
     for key, value in result.items():
+        if key in _skip:
+            continue
         if key == "errors" and isinstance(value, list) and value:
             lines.append(f"errors: {len(value)} error(s)")
             for err in value:
@@ -497,11 +530,19 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
     lines.append(f"Destination  : {result.get('destination', '?')}")
     lines.append(f"Method       : {result.get('method', '?')}")
 
-    source_paths = result.get("source_paths", [])
-    if source_paths:
+    sources = result.get("sources", [])
+    if sources:
         lines.append("Source paths :")
-        for sp in source_paths:
-            lines.append(f"  {sp}")
+        for s in sources:
+            icon = "✓" if s.get("exists") else "✗"
+            lines.append(f"  {icon} {s.get('path', '?')}")
+    else:
+        # Fallback to flat list for JSON or older backends
+        source_paths = result.get("source_paths", [])
+        if source_paths:
+            lines.append("Source paths :")
+            for sp in source_paths:
+                lines.append(f"  {sp}")
 
     lines.append(f"Dest path    : {result.get('dest_path', '?')}")
     lines.append(f"Dest exists  : {'yes' if result.get('dest_exists') else 'no'}")

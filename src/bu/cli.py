@@ -5,11 +5,8 @@ Usage:
 
 Actions:
     backup    Back up source paths to the destination
-    restore   Restore data from the destination to a local path
-    check     Show what files would be backed up
-    verify    Verify integrity of backed-up data
-    status    Show status of the backup destination
-    config    Edit the configuration file in $EDITOR
+    status    Show status and last backup details
+    config    Edit a destination configuration in $EDITOR
     history   Show action history for a destination
 """
 
@@ -24,12 +21,9 @@ import click
 from bu import __version__
 from bu.actions import (
     action_backup,
-    action_check,
     action_config,
     action_history,
-    action_restore,
     action_status,
-    action_verify,
     format_history,
     format_result,
     format_status,
@@ -124,72 +118,6 @@ def backup(
 
     # Exit non-zero if there were errors
     if result.get("errors"):
-        sys.exit(1)
-
-
-@main.command()
-@_CONFIG
-@_DRY_RUN
-@_JSON
-@_DEST_ARG
-@click.option("--to", "-t", "restore_path", required=True, help="Local path to restore files to.")
-def restore(
-    config_dir: Path | None,
-    dry_run: bool,
-    json_output: bool,
-    destination: str,
-    restore_path: str,
-) -> None:
-    """Restore data from DESTINATION to a local path."""
-    dest = _resolve_destination(config_dir, destination)
-
-    result = action_restore(dest, restore_path, dry_run=dry_run)
-    click.echo(format_result(result, json_output=json_output))
-
-    if result.get("errors"):
-        sys.exit(1)
-
-
-@main.command()
-@_CONFIG
-@_JSON
-@_DEST_ARG
-@click.option("--source", "-s", "sources", multiple=True, help="Override source paths (can be repeated).")
-def check(
-    config_dir: Path | None,
-    json_output: bool,
-    destination: str,
-    sources: tuple[str, ...],
-) -> None:
-    """Check what files would be backed up to DESTINATION."""
-    dest = _resolve_destination(config_dir, destination)
-
-    extra_args: dict[str, Any] = {}
-    if sources:
-        extra_args["source_paths"] = list(sources)
-
-    result = action_check(dest, extra_args=extra_args or None)
-    click.echo(format_result(result, json_output=json_output))
-
-
-@main.command()
-@_CONFIG
-@_JSON
-@_DEST_ARG
-@click.option("--full", is_flag=True, help="Perform full checksum verification.")
-def verify(
-    config_dir: Path | None,
-    json_output: bool,
-    destination: str,
-    full: bool,
-) -> None:
-    """Verify integrity of backed-up data at DESTINATION."""
-    dest = _resolve_destination(config_dir, destination)
-
-    result = action_verify(dest, full=full)
-    click.echo(format_result(result, json_output=json_output))
-
-    if result.get("missing") or result.get("mismatched"):
         sys.exit(1)
 
 

@@ -27,51 +27,9 @@ class Backend(ABC):
         dry_run: bool = False,
         extra_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Back up the given source paths to this backend.
+        """Back up the given source paths.
 
         Returns a dict with summary information (files_copied, bytes_copied, etc.).
-        """
-        ...
-
-    @abstractmethod
-    def restore(
-        self,
-        restore_path: str,
-        *,
-        dry_run: bool = False,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Restore data from this backend to restore_path.
-
-        Returns a dict with summary information.
-        """
-        ...
-
-    @abstractmethod
-    def check(
-        self,
-        source_paths: list[str],
-        *,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Check what would be backed up (diff between source and destination).
-
-        Returns a dict with files_to_backup, files_to_update, total_size, etc.
-        """
-        ...
-
-    @abstractmethod
-    def verify(
-        self,
-        source_paths: list[str],
-        *,
-        full: bool = False,
-        extra_args: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Verify integrity of backed-up data.
-
-        If full=True, perform a full checksum comparison.
-        Returns a dict with verified count, errors, etc.
         """
         ...
 
@@ -83,6 +41,7 @@ class Backend(ABC):
     ) -> dict[str, Any]:
         """Return status information about the backup destination.
 
-        Returns a dict with last_backup, total_size, file_count, etc.
+        Returns a dict with destination, method, source_paths, dest_path,
+        dest_exists, and last_backup details.
         """
         ...

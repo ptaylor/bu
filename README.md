@@ -1,6 +1,6 @@
 # bu
 
-Backup utility for managing backups to various backends.
+Backup utility using rsync (and eventually duplicity) to mirror directories.
 
 ## Usage
 
@@ -8,140 +8,95 @@ Backup utility for managing backups to various backends.
 bu <ACTION> <DESTINATION> [OPTIONS...]
 ```
 
-- **`<ACTION>`** — one of: `backup`, `restore`, `check`, `verify`, `status`
-- **`<DESTINATION>`** — a named destination defined in the configuration file
-- **`[OPTIONS]`** — action-specific flags and parameters
+- **`<ACTION>`** — one of: `backup`, `status`, `config`, `history`
+- **`<DESTINATION>`** — a named destination defined in the configuration
+- **`[OPTIONS]`** — action-specific flags
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
-| `bu backup <DEST>` | Back up configured source paths to the destination |
-| `bu restore <DEST> --to <PATH>` | Restore data from the destination to a local path |
-| `bu check <DEST>` | Show what files would be backed up (dry-run diff) |
-| `bu verify <DEST>` | Verify integrity of backed-up data |
-| `bu status <DEST>` | Show status/summary of the backup destination |
+| `bu backup <DEST>` | Mirror source directories to the destination via rsync |
+| `bu status <DEST>` | Show config, destination state, and last backup details |
+| `bu config [<DEST>]` | Edit (or create) a destination config in `$EDITOR` |
+| `bu history <DEST>` | Show action history in reverse chronological order |
 
-Common options: `--dry-run` (`-n`), `--json`, `--config <PATH>`.
+Common options: `--dry-run` (`-n`), `--json`, `--config <DIR>`.
 
 ## Configuration
 
-Configuration is stored in TOML format. The default location is:
+Each destination is a separate `.toml` file under `~/.config/bu/` (or `$BU_CONFIG_DIR`).
 
-```
-~/.config/bu/config.toml
-```
-
-Override with the `$BU_CONFIG_PATH` environment variable or `--config` flag.
-
-### Example config.toml
+### Example: `~/.config/bu/photos.toml`
 
 ```toml
-# Local filesystem backup
-[destinations.docs]
-backend = "local"
-source_paths = ["~/Documents", "~/notes"]
-target_path = "/mnt/backup/docs"
-
-# Amazon S3 backup
-[destinations.photos]
-backend = "s3"
-source_paths = ["~/Photos"]
-bucket = "my-photo-backups"
-region = "us-east-1"
-
-# Backblaze B2 (S3-compatible)
-[destinations.offsite]
-backend = "s3"
-source_paths = ["~/Projects", "~/Documents"]
-bucket = "my-b2-bucket"
-endpoint_url = "https://s3.us-west-002.backblazeb2.com"
-region = "us-west-002"
-access_key = "000..."   # or use AWS_ACCESS_KEY_ID env var
-secret_key = "..."      # or use AWS_SECRET_ACCESS_KEY env var
-prefix = "laptop-backup"
-
-# rsync over SSH
-[destinations.server]
-backend = "rsync"
-source_paths = ["~/data", "~/configs"]
-host = "backup.example.com"
-user = "paul"
-path = "/backups/home"
-port = 22
-ssh_key = "~/.ssh/id_rsa"
+method = "rsync"
+source_paths = ["~/Photos", "~/Camera"]
+destination = "/mnt/backup"
+history_file = "/home/paul/.local/state/bu/history/photos.json"
+log_file = "/home/paul/.local/state/bu/logs/photos.log"
 ```
 
-### Backend Configuration Reference
-
-#### `local`
+### Config reference
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `target_path` | Yes | Destination directory for backups |
+| `method` | Yes | `"rsync"` or `"duplicity"` |
+| `source_paths` | Yes | Array of directory paths to back up |
+| `destination` | Yes | Base target directory (files go to `<dest>/<name>/`) |
+| `history_file` | No | Path to structured JSON-lines action history |
+| `log_file` | No | Path to raw execution log |
 
-#### `s3` (AWS S3, B2, MinIO, etc.)
+### Creating a config
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `bucket` | Yes | S3 bucket name |
-| `prefix` | No | Key prefix (folder) within the bucket |
-| `region` | No | AWS/S3 region |
-| `endpoint_url` | No | Custom endpoint for S3-compatible services |
-| `access_key` | No | Access key ID (falls back to AWS env vars) |
-| `secret_key` | No | Secret access key (falls back to AWS env vars) |
+```bash
+bu config photos --method rsync
+```
 
-#### `rsync`
+Opens `$EDITOR` (default `vi`) with a pre-filled template. If the file doesn't
+exist, it's created with sample values. After saving, the TOML is validated.
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `host` | Yes | Remote hostname or IP |
-| `path` | Yes | Remote destination path |
-| `user` | No | SSH username (defaults to current user) |
-| `port` | No | SSH port (default: 22) |
-| `ssh_key` | No | Path to SSH private key |
-| `rsync_opts` | No | Array of extra rsync options |
+### State files
+
+Per-destination runtime files are stored under `~/.local/state/bu/`:
+
+```
+~/.local/state/bu/
+├── history/<name>.json    # Structured action history (JSON-lines)
+└── logs/<name>.log        # Raw execution output per run
+```
 
 ## Installation
 
-### From source
-
 ```bash
-pip install .
-```
-
-### Development install
-
-```bash
+# Development install
 pip install -e ".[dev]"
+
+# Or install to a bin directory via symlink
+./install.sh ~/.local/bin
 ```
 
 ## Examples
 
 ```bash
-# Check what would be backed up
-bu check photos
+# Create a new destination config
+bu config photos --method rsync
+
+# See what would be backed up
+bu backup photos --dry-run
 
 # Run a backup
 bu backup photos
 
-# Dry-run a backup to see what would happen
-bu backup --dry-run server
-
-# Verify backup integrity
-bu verify photos
-
-# Full checksum verification
-bu verify --full photos
-
-# Show backup status
+# Check backup status
 bu status photos
 
-# Restore everything to a directory
-bu restore photos --to /tmp/restored
+# View action history
+bu history photos
 
 # Machine-readable output
 bu status photos --json
+bu history photos --json
 ```
 
 ## License
