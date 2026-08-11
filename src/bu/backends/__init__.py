@@ -1,29 +1,27 @@
-"""Backend plugins for bu.
+"""Backup method plugins for bu.
 
-Each backend module provides a class implementing the Backend interface.
+Each method module provides a class implementing the Backend interface.
 """
 
 from bu.backends.base import Backend
-from bu.backends.local import LocalBackend
-from bu.backends.rsync import RsyncBackend
-from bu.backends.s3 import S3Backend
+from bu.backends.local import RsyncMethod
+from bu.backends.duplicity import DuplicityMethod
 
-__all__ = ["Backend", "LocalBackend", "RsyncBackend", "S3Backend"]
+__all__ = ["Backend", "RsyncMethod", "DuplicityMethod"]
 
-# Registry of backend name -> class
+# Registry of method name -> class
 REGISTRY: dict[str, type[Backend]] = {
-    "local": LocalBackend,
-    "rsync": RsyncBackend,
-    "s3": S3Backend,
+    "rsync": RsyncMethod,
+    "duplicity": DuplicityMethod,
 }
 
 
 def get_backend(name: str) -> type[Backend]:
-    """Look up a backend class by name."""
+    """Look up a backend class by method name."""
     try:
         return REGISTRY[name]
     except KeyError:
         available = ", ".join(sorted(REGISTRY.keys()))
         raise ValueError(
-            f"Unknown backend {name!r}. Available backends: {available}"
+            f"Unknown method {name!r}. Available methods: {available}"
         ) from None

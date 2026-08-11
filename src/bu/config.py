@@ -12,10 +12,9 @@ Example layout:
 
 Example file (photos.toml):
 
-    backend = "s3"
+    method = "rsync"
     source_paths = ["/home/user/photos"]
-    bucket = "my-backups"
-    region = "us-east-1"
+    destination = "/mnt/backup/photos"
 
 Each destination gets a log file. The default location follows XDG state dirs:
     ~/.local/state/bu/logs/<name>.log
@@ -41,7 +40,10 @@ class ConfigError(Exception):
 
 
 # Keys that are handled specially and NOT passed through to backend ``extra``.
-_RESERVED_KEYS = frozenset({"backend", "source_paths", "log_file"})
+_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "log_file"})
+
+# Valid method names.
+_VALID_METHODS = frozenset({"rsync", "duplicity"})
 
 
 def _default_log_dir() -> Path:
@@ -64,8 +66,9 @@ class DestinationConfig:
 
     def __init__(self, name: str, data: dict[str, Any]) -> None:
         self.name = name
-        self.backend: str = data.get("backend", "")
+        self.method: str = data.get("method", "")
         self.source_paths: list[str] = data.get("source_paths", [])
+        self.destination: str = data.get("destination", "")
         self._log_file_override: str | None = data.get("log_file")
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
@@ -85,7 +88,7 @@ class DestinationConfig:
         return _default_log_dir() / f"{self.name}.log"
 
     def __repr__(self) -> str:
-        return f"DestinationConfig(name={self.name!r}, backend={self.backend!r})"
+        return f"DestinationConfig(name={self.name!r}, method={self.method!r})"
 
 
 class Config:
@@ -139,14 +142,23 @@ class Config:
                 errors.append(f"{fp.name}: must contain key-value pairs")
                 continue
 
-            backend = data.get("backend", "")
-            if not backend:
-                errors.append(f"{fp.name}: missing required 'backend' key")
+            method = data.get("method", "")
+            if not method:
+                errors.append(f"{fp.name}: missing required 'method' key (must be 'rsync' or 'duplicity')")
+                continue
+
+            if method not in _VALID_METHODS:
+                errors.append(f"{fp.name}: unknown method {method!r} — must be 'rsync' or 'duplicity'")
                 continue
 
             source_paths = data.get("source_paths", [])
             if not source_paths:
                 errors.append(f"{fp.name}: missing required 'source_paths'")
+                continue
+
+            destination = data.get("destination", "")
+            if not destination:
+                errors.append(f"{fp.name}: missing required 'destination' path")
                 continue
 
             self.destinations[name] = DestinationConfig(name, data)

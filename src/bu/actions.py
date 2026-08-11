@@ -23,52 +23,41 @@ from bu.backends import get_backend
 from bu.config import Config, ConfigError, DestinationConfig
 from bu.logging import ActionLogger, group_entries, read_log
 
-# Per-backend sample configs used when creating a new destination file.
-_SAMPLE_LOCAL = """\
-# Local filesystem destination
-backend = "local"
-source_paths = ["~/Documents", "~/notes"]
-target_path = "/mnt/backup/docs"
-{log_file}
-"""
-
-_SAMPLE_S3 = """\
-# S3 / S3-compatible destination (AWS, B2, MinIO, etc.)
-backend = "s3"
-source_paths = ["~/Photos"]
-bucket = "my-backups"
-region = "us-east-1"
-# prefix = "photos/"          # optional: folder within the bucket
-# endpoint_url = ""           # optional: for S3-compatible services
-# access_key = ""             # optional: falls back to AWS_ env vars
-# secret_key = ""             # optional: falls back to AWS_ env vars
-{log_file}
-"""
-
+# Per-method sample configs used when creating a new destination file.
 _SAMPLE_RSYNC = """\
-# rsync-over-SSH destination
-backend = "rsync"
-source_paths = ["~/data", "~/configs"]
-host = "backup.example.com"
-user = "paul"
-path = "/backups/home"
-port = 22
-# ssh_key = "~/.ssh/id_rsa"
+# rsync method — copies files to a local directory
+method = "rsync"
+source_paths = ["~/Documents", "~/notes"]
+destination = "/mnt/backup/docs"
+{log_file}
+"""
+
+_SAMPLE_DUPLICITY = """\
+# duplicity method — encrypted, incremental backup archives
+method = "duplicity"
+source_paths = ["~/Documents", "~/notes"]
+destination = "/mnt/backup/docs"
 {log_file}
 """
 
 _SAMPLE_GENERIC = """\
 # bu destination configuration
-# backend = "local"   # or "s3" or "rsync"
+# method = "rsync"   # or "duplicity"
 # source_paths = ["/path/to/backup"]
+# destination = "/path/to/backup/location"
 {log_file}
 """
 
 
 def _build_backend(dest: DestinationConfig) -> Any:
     """Instantiate the backend for the given destination config."""
-    backend_cls = get_backend(dest.backend)
-    return backend_cls(dest.extra)
+    backend_cls = get_backend(dest.method)
+    # Pass all necessary info to the backend via config
+    config = dict(dest.extra)
+    config["destination"] = dest.destination
+    config["_name"] = dest.name
+    config["_source_paths"] = list(dest.source_paths)
+    return backend_cls(config)
 
 
 def action_backup(
@@ -161,8 +150,8 @@ def _default_config_dir() -> Path:
     return Path(xdg) / "bu"
 
 
-def _sample_for_backend(backend: str, destination: str) -> str:
-    """Return a sample config template for the given backend type.
+def _sample_for_method(method: str, destination: str) -> str:
+    """Return a sample config template for the given method type.
 
     The ``log_file`` key is pre-filled with the default computed path.
     """
@@ -171,11 +160,10 @@ def _sample_for_backend(backend: str, destination: str) -> str:
     log_line = f'log_file = "{log_path}"'
 
     samples: dict[str, str] = {
-        "local": _SAMPLE_LOCAL,
-        "s3": _SAMPLE_S3,
         "rsync": _SAMPLE_RSYNC,
+        "duplicity": _SAMPLE_DUPLICITY,
     }
-    template = samples.get(backend, _SAMPLE_GENERIC)
+    template = samples.get(method, _SAMPLE_GENERIC)
     return template.format(log_file=log_line)
 
 
@@ -183,12 +171,12 @@ def action_config(
     config_dir: Path | None = None,
     *,
     destination: str | None = None,
-    backend: str | None = None,
+    method: str | None = None,
 ) -> dict[str, Any]:
     """Open a destination config file in $EDITOR (default vi) for editing.
 
     If the config file does not exist, it is created with sample content
-    for the given backend (or a generic template if no backend specified).
+    for the given method (or a generic template if no method specified).
     After the editor closes, the TOML is validated.
 
     Parameters
@@ -198,8 +186,8 @@ def action_config(
     destination : str or None
         The destination name to edit. Required for editing a specific destination.
         If None, lists all configured destinations.
-    backend : str or None
-        Backend type hint for the sample template (only used when creating a new file).
+    method : str or None
+        Method type hint for the sample template (only used when creating a new file).
     """
     cfg_dir = config_dir or _default_config_dir()
 
@@ -214,7 +202,7 @@ def action_config(
                 "config_dir": str(cfg_dir),
                 "destinations": dests,
                 "hint": f"Run 'bu config <name>' to edit a destination, "
-                        f"or 'bu config <name> --backend local|s3|rsync' to create one.",
+                        f"or 'bu config <name> --method rsync|duplicity' to create one.",
             }
         else:
             return {
@@ -222,7 +210,7 @@ def action_config(
                 "config_dir": str(cfg_dir),
                 "destinations": [],
                 "hint": "No destinations yet. "
-                        "Run 'bu config <name> --backend local|s3|rsync' to create one.",
+                        "Run 'bu config <name> --method rsync|duplicity' to create one.",
             }
 
     # Determine the file path for this destination
@@ -232,7 +220,7 @@ def action_config(
     created = False
     if not file_path.exists():
         cfg_dir.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(_sample_for_backend(backend or "", destination))
+        file_path.write_text(_sample_for_method(method or "", destination))
         created = True
 
     # Determine the editor
@@ -281,23 +269,23 @@ def action_config(
             "errors": ["Config must contain key-value pairs (not an array)."],
         }
 
-    raw_backend = raw.get("backend", "")
-    if not raw_backend:
+    raw_method = raw.get("method", "")
+    if not raw_method:
         return {
             "ok": False,
             "destination": destination,
             "created": created,
             "file": str(file_path),
-            "errors": ["Missing required 'backend' key. Must be one of: local, s3, rsync."],
+            "errors": ["Missing required 'method' key. Must be one of: rsync, duplicity."],
         }
 
-    if raw_backend not in ("local", "s3", "rsync"):
+    if raw_method not in ("rsync", "duplicity"):
         return {
             "ok": False,
             "destination": destination,
             "created": created,
             "file": str(file_path),
-            "errors": [f"Unknown backend {raw_backend!r}. Must be one of: local, s3, rsync."],
+            "errors": [f"Unknown method {raw_method!r}. Must be one of: rsync, duplicity."],
         }
 
     source_paths = raw.get("source_paths", [])
@@ -310,6 +298,16 @@ def action_config(
             "errors": ["Missing required 'source_paths' key."],
         }
 
+    raw_dest = raw.get("destination", "")
+    if not raw_dest:
+        return {
+            "ok": False,
+            "destination": destination,
+            "created": created,
+            "file": str(file_path),
+            "errors": ["Missing required 'destination' key (backup target path)."],
+        }
+
     # Build a DestinationConfig directly from the parsed data so we
     # validate *only* this file — not every .toml in the directory.
     dest_cfg = DestinationConfig(destination, raw)
@@ -318,7 +316,8 @@ def action_config(
         "ok": True,
         "destination": {
             "name": destination,
-            "backend": dest_cfg.backend,
+            "method": dest_cfg.method,
+            "path": dest_cfg.destination,
             "source_paths": dest_cfg.source_paths,
         },
         "created": created,
@@ -486,4 +485,58 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
                 lines.append(f"{key}: {len(value)} item(s)")
         else:
             lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def format_status(result: dict[str, Any], json_output: bool = False) -> str:
+    """Format status results for display."""
+    if json_output:
+        return json.dumps(result, indent=2, default=str)
+
+    lines: list[str] = []
+    lines.append(f"Destination  : {result.get('destination', '?')}")
+    lines.append(f"Method       : {result.get('method', '?')}")
+
+    source_paths = result.get("source_paths", [])
+    if source_paths:
+        lines.append("Source paths :")
+        for sp in source_paths:
+            lines.append(f"  {sp}")
+
+    lines.append(f"Dest path    : {result.get('dest_path', '?')}")
+    lines.append(f"Dest exists  : {'yes' if result.get('dest_exists') else 'no'}")
+
+    last = result.get("last_backup")
+    if last is None:
+        lines.append("")
+        lines.append("No backup has been run yet.")
+    elif isinstance(last, dict):
+        lines.append("")
+        lines.append("Last backup")
+        lines.append("-----------")
+        state = last.get("state", "?")
+        state_icon = {"completed": "✓", "started": "…", "error": "✗"}.get(state, "?")
+        lines.append(f"  State       : {state_icon} {state}")
+        ts = last.get("timestamp", "")
+        if ts:
+            try:
+                dt = datetime.datetime.fromisoformat(ts)
+                ts = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                pass
+            lines.append(f"  Timestamp   : {ts}")
+        for key, label in [("files_copied", "Files copied"), ("bytes_copied", "Bytes copied")]:
+            if key in last:
+                val = last[key]
+                if label == "Bytes copied" and isinstance(val, (int, float)):
+                    val = _format_size(int(val))
+                lines.append(f"  {label:12s} {val}")
+        errors = last.get("errors", [])
+        if errors:
+            lines.append(f"  Errors      : {len(errors)}")
+            for err in errors:
+                lines.append(f"    - {err}")
+    elif result.get("status_file_error"):
+        lines.append(f"  Status file : corrupt ({result['status_file_error']})")
+
     return "\n".join(lines)

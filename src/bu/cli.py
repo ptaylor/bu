@@ -32,6 +32,7 @@ from bu.actions import (
     action_verify,
     format_history,
     format_result,
+    format_status,
 )
 from bu.config import Config, ConfigError, DestinationConfig
 
@@ -80,7 +81,7 @@ def _resolve_destination(config_dir: Path | None, destination: str) -> Destinati
 @click.version_option(__version__, "-V", "--version")
 @click.pass_context
 def main(ctx: click.Context) -> None:
-    """bu — Backup utility for managing backups to various backends.
+    """bu — Backup utility for managing backups via rsync or duplicity.
 
     Run 'bu <ACTION> --help' for details on each action.
     """
@@ -93,9 +94,9 @@ def main(ctx: click.Context) -> None:
             if dests:
                 click.echo(f"\nConfigured destinations: {', '.join(dests)}")
             else:
-                click.echo("\nNo destinations configured. Run 'bu config <name> --backend <type>' to create one.")
+                click.echo("\nNo destinations configured. Run 'bu config <name> --method <type>' to create one.")
         except ConfigError:
-            click.echo("\nNo config directory found. Run 'bu config <name> --backend <type>' to get started.")
+            click.echo("\nNo config directory found. Run 'bu config <name> --method <type>' to get started.")
 
 
 @main.command()
@@ -205,7 +206,7 @@ def status(
     dest = _resolve_destination(config_dir, destination)
 
     result = action_status(dest)
-    click.echo(format_result(result, json_output=json_output))
+    click.echo(format_status(result, json_output=json_output))
 
 
 @main.command()
@@ -213,23 +214,23 @@ def status(
 @_JSON
 @click.argument("destination", metavar="<DESTINATION>", required=False, default=None)
 @click.option(
-    "--backend", "-b", "backend",
-    type=click.Choice(["local", "s3", "rsync"]),
-    help="Backend type for the sample template when creating a new destination.",
+    "--method", "-m", "method",
+    type=click.Choice(["rsync", "duplicity"]),
+    help="Backup method for the sample template when creating a new destination.",
 )
 def config(
     config_dir: Path | None,
     json_output: bool,
     destination: str | None,
-    backend: str | None,
+    method: str | None,
 ) -> None:
     """Edit a destination configuration in $EDITOR.
 
     If <DESTINATION> is given, opens (or creates) its .toml file.
-    Use --backend to get a tailored sample template for new destinations.
+    Use --method to get a tailored sample template for new destinations.
     Without <DESTINATION>, lists all configured destinations.
     """
-    result = action_config(config_dir, destination=destination, backend=backend)
+    result = action_config(config_dir, destination=destination, method=method)
     click.echo(format_result(result, json_output=json_output))
 
     if not result.get("ok"):

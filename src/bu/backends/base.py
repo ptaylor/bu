@@ -13,8 +13,9 @@ class Backend(ABC):
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialise the backend with its configuration dictionary.
 
-        The config dict contains all keys from the TOML destination entry
-        except 'backend' and 'source_paths'.
+        The config dict contains the ``destination`` path plus any extra
+        keys from the TOML destination entry (excluding reserved keys).
+        Internal keys ``_name`` and ``_source_paths`` are also provided.
         """
         self.config = config
 
