@@ -9,6 +9,7 @@ Actions:
     status    Show status and last backup details
     config    Edit a destination configuration in $EDITOR
     history   Show action history for a destination
+    log       Print the raw execution log for a destination
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from bu.actions import (
     action_backup,
     action_config,
     action_history,
+    action_log,
     action_restore,
     action_status,
     format_history,
@@ -155,6 +157,9 @@ def restore(
 
     if result.get("errors"):
         sys.exit(1)
+
+
+@main.command()
 @_CONFIG
 @_JSON
 @_DEST_ARG
@@ -219,3 +224,22 @@ def history(
 
     result = action_history(dest, limit=limit)
     click.echo(format_history(result, json_output=json_output))
+
+
+@main.command()
+@_CONFIG
+@_DEST_ARG
+@click.option("--lines", "-n", type=int, default=0, help="Show only the last N lines.")
+def log(
+    config_dir: Path | None,
+    destination: str,
+    lines: int,
+) -> None:
+    """Print the raw execution log for DESTINATION to stdout."""
+    dest = _resolve_destination(config_dir, destination)
+
+    result = action_log(dest, lines=lines)
+    if not result.get("ok"):
+        click.echo(f"Error: {result.get('errors', ['unknown error'])[0]}", err=True)
+        sys.exit(1)
+    click.echo(result["content"], nl=False)

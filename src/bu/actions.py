@@ -38,6 +38,8 @@ _SAMPLE_DUPLICITY = """\
 method = "duplicity"
 source_paths = ["~/Documents", "~/notes"]
 destination = "/mnt/backup/docs"
+# passphrase_file = "~/.config/bu/secrets/docs.pass"   # optional: first line holds the passphrase
+# full_if_older_than = "30D"                           # optional: full backup cadence
 {history_file}
 {log_file}
 """
@@ -123,10 +125,11 @@ def _write_raw_log(
         lines.append(f"Dest path   : {dest.destination}")
     lines.append(f"Dry run     : {result.get('dry_run', False)}")
 
-    # Rsync version (only present for rsync method)
-    version = result.get("rsync_version", "")
-    if version:
-        lines.append(f"Rsync ver   : {version}")
+    # Tool version (rsync or duplicity)
+    for label, key in [("Rsync ver", "rsync_version"), ("Duplicity ver", "duplicity_version")]:
+        if version := result.get(key, ""):
+            lines.append(f"{label:12s} {version}")
+            break
 
     # Stats
     for label, key in [("Files copied", "files_copied"), ("Files restored", "files_restored"),
@@ -193,6 +196,31 @@ def action_restore(
     _write_raw_log(dest, "restore", start_ts, result, restore_to=restore_path)
 
     return result
+
+
+def action_log(
+    dest: DestinationConfig,
+    *,
+    lines: int = 0,
+) -> dict[str, Any]:
+    """Return the raw execution log content for a destination."""
+    log_path = dest.log_file
+    if not log_path.exists():
+        return {
+            "ok": False,
+            "log_file": str(log_path),
+            "errors": [f"Log file not found: {log_path}"],
+        }
+
+    content = log_path.read_text()
+    if lines > 0:
+        content = "\n".join(content.splitlines()[-lines:]) + "\n"
+
+    return {
+        "ok": True,
+        "log_file": str(log_path),
+        "content": content,
+    }
 
 
 def action_status(
@@ -541,7 +569,7 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
         return json.dumps(result, indent=2, default=str)
 
     # Internal keys not meant for display
-    _skip = {"stdout", "stderr", "rsync_version", "dry_run"}
+    _skip = {"stdout", "stderr", "rsync_version", "duplicity_version", "dry_run"}
 
     lines: list[str] = []
     for key, value in result.items():
