@@ -34,6 +34,25 @@ class Backend(ABC):
         ...
 
     @abstractmethod
+    def restore(
+        self,
+        restore_path: str,
+        path_within_backup: str | None = None,
+        *,
+        dry_run: bool = False,
+        extra_args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Restore files from the backup into ``restore_path``.
+
+        ``path_within_backup`` optionally narrows the restore to a
+        subpath within the backup.  Must never delete files in the
+        restore destination.
+
+        Returns a dict with files_restored, bytes_restored, etc.
+        """
+        ...
+
+    @abstractmethod
     def status(
         self,
         *,

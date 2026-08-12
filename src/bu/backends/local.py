@@ -155,6 +155,52 @@ class RsyncMethod(Backend):
             "rsync_version": self._rsync_version(),
         }
 
+    # ------------------------------------------------------------------
+    # restore action
+    # ------------------------------------------------------------------
+
+    def restore(
+        self,
+        restore_path: str,
+        path_within_backup: str | None = None,
+        *,
+        dry_run: bool = False,
+        extra_args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Restore files from the backup to ``restore_path`` via rsync.
+
+        Never deletes files in the restore destination (no --delete).
+        """
+        # Validate restore destination
+        errors: list[str] = []
+        restore_dir = Path(restore_path).expanduser()
+        if not restore_dir.exists():
+            errors.append(f"Restore destination not found: {restore_dir}")
+        elif not restore_dir.is_dir():
+            errors.append(f"Restore destination is not a directory: {restore_dir}")
+        if errors:
+            return {"files_restored": 0, "bytes_restored": 0, "errors": errors}
+
+        # Build source: <dest>/<name>/[path_within_backup]
+        src = self._dest_dir()
+        if path_within_backup:
+            src = src / path_within_backup
+
+        if not src.exists():
+            return {"files_restored": 0, "bytes_restored": 0,
+                    "errors": [f"Backup path not found: {src}"]}
+
+        result = self._rsync_one(src, restore_dir, dry_run, delete=False)
+
+        return {
+            "files_restored": result["files"],
+            "bytes_restored": result["bytes"],
+            "errors": result["errors"],
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "rsync_version": self._rsync_version(),
+        }
+
     def _rsync_version(self) -> str:
         """Return the rsync version string, or empty on failure."""
         try:
@@ -166,9 +212,16 @@ class RsyncMethod(Backend):
         except (FileNotFoundError, OSError):
             return ""
 
-    def _rsync_one(self, src: Path, dest: Path, dry_run: bool) -> dict[str, Any]:
+    def _rsync_one(
+        self,
+        src: Path,
+        dest: Path,
+        dry_run: bool,
+        delete: bool = True,
+    ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
+        ``delete=False`` keeps the restore non-destructive.
         Returns ``{files, bytes, errors, stdout, stderr}``.
         """
         # Ensure dest parent exists (rsync can create the leaf)
@@ -176,7 +229,9 @@ class RsyncMethod(Backend):
             dest.parent.mkdir(parents=True, exist_ok=True)
 
         # Trailing slash on src: copy *contents*, not the directory itself.
-        cmd = ["rsync"] + self.RSYNC_FLAGS
+        cmd = ["rsync", "-a", "-h", "--stats"]
+        if delete:
+            cmd.append("--delete")
         if dry_run:
             cmd.append("--dry-run")
         cmd.append(f"{src}/")

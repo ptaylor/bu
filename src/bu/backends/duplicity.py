@@ -26,6 +26,9 @@ class DuplicityMethod(Backend):
     def backup(self, source_paths, *, dry_run=False, extra_args=None):
         return self._stub()
 
+    def restore(self, restore_path, path_within_backup=None, *, dry_run=False, extra_args=None):
+        return {"files_restored": 0, "bytes_restored": 0, "errors": ["duplicity method is not yet implemented"]}
+
     def status(self, *, extra_args=None):
         return {
             "destination": self.config.get("_name", "unknown"),

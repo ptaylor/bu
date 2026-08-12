@@ -100,6 +100,7 @@ def _write_raw_log(
     action: str,
     start_ts: datetime.datetime,
     result: dict[str, Any],
+    restore_to: str | None = None,
 ) -> None:
     """Append a raw execution log entry to the destination's log file."""
     end_ts = datetime.datetime.now(datetime.timezone.utc)
@@ -113,10 +114,13 @@ def _write_raw_log(
     lines.append(f"Method      : {dest.method}")
     lines.append(f"Started     : {start_ts.isoformat()}")
     lines.append(f"Ended       : {end_ts.isoformat()}")
-    lines.append(f"Source paths:")
-    for sp in dest.source_paths:
-        lines.append(f"  {sp}")
-    lines.append(f"Dest path   : {dest.destination}")
+    if restore_to:
+        lines.append(f"Restore to  : {restore_to}")
+    else:
+        lines.append(f"Source paths:")
+        for sp in dest.source_paths:
+            lines.append(f"  {sp}")
+        lines.append(f"Dest path   : {dest.destination}")
     lines.append(f"Dry run     : {result.get('dry_run', False)}")
 
     # Rsync version (only present for rsync method)
@@ -153,6 +157,42 @@ def _write_raw_log(
 
     with open(log_path, "a") as fh:
         fh.write("\n".join(lines) + "\n")
+
+
+def action_restore(
+    dest: DestinationConfig,
+    restore_path: str,
+    path_within_backup: str | None = None,
+    *,
+    dry_run: bool = False,
+    extra_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore files from the configured destination."""
+    start_ts = datetime.datetime.now(datetime.timezone.utc)
+
+    logger = ActionLogger(dest.history_file)
+    logger.start("restore", dest.name)
+
+    backend = _build_backend(dest)
+    result = backend.restore(
+        restore_path,
+        path_within_backup,
+        dry_run=dry_run,
+        extra_args=extra_args,
+    )
+
+    for err in result.get("errors", []):
+        logger.error(str(err))
+
+    logger.end(
+        files_restored=result.get("files_restored", 0),
+        bytes_restored=result.get("bytes_restored", 0),
+        dry_run=dry_run,
+    )
+
+    _write_raw_log(dest, "restore", start_ts, result, restore_to=restore_path)
+
+    return result
 
 
 def action_status(

@@ -5,6 +5,7 @@ Usage:
 
 Actions:
     backup    Back up source paths to the destination
+    restore   Restore files into a local directory (never deletes)
     status    Show status and last backup details
     config    Edit a destination configuration in $EDITOR
     history   Show action history for a destination
@@ -23,6 +24,7 @@ from bu.actions import (
     action_backup,
     action_config,
     action_history,
+    action_restore,
     action_status,
     format_history,
     format_result,
@@ -122,6 +124,37 @@ def backup(
 
 
 @main.command()
+@_CONFIG
+@_DRY_RUN
+@_JSON
+@_DEST_ARG
+@click.argument("restore_dir", metavar="<RESTORE_DIR>")
+@click.argument("path_within_backup", metavar="[PATH_WITHIN_BACKUP]", required=False, default=None)
+def restore(
+    config_dir: Path | None,
+    dry_run: bool,
+    json_output: bool,
+    destination: str,
+    restore_dir: str,
+    path_within_backup: str | None,
+) -> None:
+    """Restore files from DESTINATION into RESTORE_DIR.
+
+    RESTORE_DIR must exist. PATH_WITHIN_BACKUP optionally narrows the
+    restore to a subpath within the backup. Restore never deletes files.
+    """
+    dest = _resolve_destination(config_dir, destination)
+
+    result = action_restore(
+        dest,
+        restore_dir,
+        path_within_backup,
+        dry_run=dry_run,
+    )
+    click.echo(format_result(result, json_output=json_output))
+
+    if result.get("errors"):
+        sys.exit(1)
 @_CONFIG
 @_JSON
 @_DEST_ARG
