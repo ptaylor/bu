@@ -15,10 +15,11 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-from bu.backends.base import Backend
+from bu.backends.base import Backend, LiveWindow, run_streaming
 
 
 class RsyncMethod(Backend):
@@ -99,8 +100,13 @@ class RsyncMethod(Backend):
         *,
         dry_run: bool = False,
         extra_args: dict[str, Any] | None = None,
+        scroll_lines: int = 0,
     ) -> dict[str, Any]:
-        """Run rsync for each source directory into the destination subdir."""
+        """Run rsync for each source directory into the destination subdir.
+
+        Output streams live; with ``scroll_lines`` > 0 it is confined to a
+        fixed-height terminal window.
+        """
         errors = self._validate_sources_are_dirs(source_paths)
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}
@@ -121,14 +127,23 @@ class RsyncMethod(Backend):
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
-        for src_str in source_paths:
-            src = Path(src_str).expanduser().resolve()
-            result = self._rsync_one(src, dest / src.name, dry_run)
-            total_files += result["files"]
-            total_bytes += result["bytes"]
-            all_errors.extend(result["errors"])
-            all_stdout.append(result.get("stdout", ""))
-            all_stderr.append(result.get("stderr", ""))
+        # One live window shared across all source runs
+        window = LiveWindow(
+            scroll_lines,
+            title=f"Backup output — {self.config.get('_name', '?')}",
+        )
+        window.__enter__()
+        try:
+            for src_str in source_paths:
+                src = Path(src_str).expanduser().resolve()
+                result = self._rsync_one(src, dest / src.name, dry_run, window=window)
+                total_files += result["files"]
+                total_bytes += result["bytes"]
+                all_errors.extend(result["errors"])
+                all_stdout.append(result.get("stdout", ""))
+                all_stderr.append(result.get("stderr", ""))
+        finally:
+            window.__exit__(None, None, None)
 
         if not dry_run:
             if all_errors:
@@ -166,6 +181,7 @@ class RsyncMethod(Backend):
         *,
         dry_run: bool = False,
         extra_args: dict[str, Any] | None = None,
+        scroll_lines: int = 0,
     ) -> dict[str, Any]:
         """Restore files from the backup to ``restore_path`` via rsync.
 
@@ -190,7 +206,14 @@ class RsyncMethod(Backend):
             return {"files_restored": 0, "bytes_restored": 0,
                     "errors": [f"Backup path not found: {src}"]}
 
-        result = self._rsync_one(src, restore_dir, dry_run, delete=False)
+        result = self._rsync_one(
+            src,
+            restore_dir,
+            dry_run,
+            delete=False,
+            scroll_lines=scroll_lines,
+            title=f"Restore output — {self.config.get('_name', '?')}",
+        )
 
         return {
             "files_restored": result["files"],
@@ -218,10 +241,15 @@ class RsyncMethod(Backend):
         dest: Path,
         dry_run: bool,
         delete: bool = True,
+        scroll_lines: int = 0,
+        window: "LiveWindow | None" = None,
+        title: str = "Live output",
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
         ``delete=False`` keeps the restore non-destructive.
+        Output streams live (``-v`` file listing; ``--progress`` bars when
+        stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
         """
         # Ensure dest parent exists (rsync can create the leaf)
@@ -229,7 +257,9 @@ class RsyncMethod(Backend):
             dest.parent.mkdir(parents=True, exist_ok=True)
 
         # Trailing slash on src: copy *contents*, not the directory itself.
-        cmd = ["rsync", "-a", "-h", "--stats"]
+        cmd = ["rsync", "-a", "-h", "--stats", "-v"]
+        if sys.stdout.isatty():
+            cmd.append("--progress")
         if delete:
             cmd.append("--delete")
         if dry_run:
@@ -238,9 +268,10 @@ class RsyncMethod(Backend):
         cmd.append(str(dest))
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = run_streaming(cmd, scroll_lines=scroll_lines, window=window, title=title)
         except FileNotFoundError:
-            return {"files": 0, "bytes": 0, "errors": ["rsync binary not found. Is it installed?"]}
+            return {"files": 0, "bytes": 0, "errors": ["rsync binary not found. Is it installed?"],
+                    "stdout": "", "stderr": ""}
 
         errors: list[str] = []
         if proc.returncode != 0:

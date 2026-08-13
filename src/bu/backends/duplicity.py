@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from bu.backends.base import Backend
+from bu.backends.base import Backend, LiveWindow, run_streaming
 
 
 class DuplicityMethod(Backend):
@@ -105,6 +105,9 @@ class DuplicityMethod(Backend):
         self,
         args: list[str],
         passphrase: str | None,
+        scroll_lines: int = 0,
+        window: "LiveWindow | None" = None,
+        title: str = "Live output",
     ) -> dict[str, Any]:
         """Run the duplicity CLI.  Returns ``{files, bytes, errors, stdout, stderr}``."""
         env = dict(os.environ)
@@ -115,7 +118,7 @@ class DuplicityMethod(Backend):
 
         cmd = ["duplicity"] + args
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, env=env, check=False)
+            proc = run_streaming(cmd, env=env, scroll_lines=scroll_lines, window=window, title=title)
         except FileNotFoundError:
             return {"files": 0, "bytes": 0,
                     "errors": ["duplicity binary not found. Is it installed?"],
@@ -150,6 +153,19 @@ class DuplicityMethod(Backend):
         except ValueError:
             return 0
 
+    def _verbosity(self) -> int:
+        """Return the duplicity verbosity level.
+
+        Uses the optional ``verbosity`` config key (0-9); otherwise defaults
+        to 6 when stdout is a TTY (file-level logs) and 4 when piped.
+        """
+        if "verbosity" in self.config:
+            try:
+                return max(0, min(9, int(self.config["verbosity"])))
+            except (TypeError, ValueError):
+                pass
+        return 6 if sys.stdout.isatty() else 4
+
     def _duplicity_version(self) -> str:
         """Return the duplicity version string, or empty on failure."""
         try:
@@ -170,6 +186,7 @@ class DuplicityMethod(Backend):
         *,
         dry_run: bool = False,
         extra_args: dict[str, Any] | None = None,
+        scroll_lines: int = 0,
     ) -> dict[str, Any]:
         errors: list[str] = []
 
@@ -209,32 +226,43 @@ class DuplicityMethod(Backend):
         all_stderr: list[str] = []
 
         used_subdirs: set[str] = set()
-        for idx, sp in enumerate(source_paths):
-            src = Path(sp).expanduser().resolve()
+        window = LiveWindow(
+            scroll_lines,
+            title=f"Backup output — {self.config.get('_name', '?')}",
+        )
+        window.__enter__()
+        try:
+            for idx, sp in enumerate(source_paths):
+                src = Path(sp).expanduser().resolve()
 
-            # Unique archive subdir per source (basename, deduped)
-            subdir = src.name or f"src{idx}"
-            candidate = subdir
-            n = 2
-            while candidate in used_subdirs:
-                candidate = f"{subdir}_{n}"
-                n += 1
-            used_subdirs.add(candidate)
+                # Unique archive subdir per source (basename, deduped)
+                subdir = src.name or f"src{idx}"
+                candidate = subdir
+                n = 2
+                while candidate in used_subdirs:
+                    candidate = f"{subdir}_{n}"
+                    n += 1
+                used_subdirs.add(candidate)
 
-            args: list[str] = []
-            if cadence := self.config.get("full_if_older_than"):
-                args.append(f"--full-if-older-than={cadence}")
-            if dry_run:
-                args.append("--dry-run")
-            args.append(str(src))
-            args.append(self._target_url(candidate))
+                args: list[str] = []
+                if cadence := self.config.get("full_if_older_than"):
+                    args.append(f"--full-if-older-than={cadence}")
+                args.append(f"--verbosity={self._verbosity()}")
+                if sys.stdout.isatty():
+                    args.append("--progress")
+                if dry_run:
+                    args.append("--dry-run")
+                args.append(str(src))
+                args.append(self._target_url(candidate))
 
-            result = self._run_duplicity(args, passphrase)
-            total_files += result["files"]
-            total_bytes += result["bytes"]
-            all_errors.extend(result["errors"])
-            all_stdout.append(result.get("stdout", ""))
-            all_stderr.append(result.get("stderr", ""))
+                result = self._run_duplicity(args, passphrase, window=window)
+                total_files += result["files"]
+                total_bytes += result["bytes"]
+                all_errors.extend(result["errors"])
+                all_stdout.append(result.get("stdout", ""))
+                all_stderr.append(result.get("stderr", ""))
+        finally:
+            window.__exit__(None, None, None)
 
         return {
             "files_copied": total_files,
@@ -253,6 +281,7 @@ class DuplicityMethod(Backend):
         *,
         dry_run: bool = False,
         extra_args: dict[str, Any] | None = None,
+        scroll_lines: int = 0,
     ) -> dict[str, Any]:
         errors: list[str] = []
 
@@ -286,25 +315,36 @@ class DuplicityMethod(Backend):
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
-        for subdir in archives:
-            # With a specific subpath restore directly into restore_dir;
-            # otherwise restore each archive into its own subdirectory.
-            dest_dir = restore_dir if path_within_backup else restore_dir / subdir
-            if not dry_run:
-                dest_dir.mkdir(parents=True, exist_ok=True)
+        window = LiveWindow(
+            scroll_lines,
+            title=f"Restore output — {self.config.get('_name', '?')}",
+        )
+        window.__enter__()
+        try:
+            for subdir in archives:
+                # With a specific subpath restore directly into restore_dir;
+                # otherwise restore each archive into its own subdirectory.
+                dest_dir = restore_dir if path_within_backup else restore_dir / subdir
+                if not dry_run:
+                    dest_dir.mkdir(parents=True, exist_ok=True)
 
-            args = ["restore"]
-            if dry_run:
-                args.append("--dry-run")
-            args.append(self._target_url(subdir))
-            args.append(str(dest_dir))
+                args = ["restore"]
+                args.append(f"--verbosity={self._verbosity()}")
+                if sys.stdout.isatty():
+                    args.append("--progress")
+                if dry_run:
+                    args.append("--dry-run")
+                args.append(self._target_url(subdir))
+                args.append(str(dest_dir))
 
-            result = self._run_duplicity(args, passphrase)
-            total_files += result["files"]
-            total_bytes += result["bytes"]
-            all_errors.extend(result["errors"])
-            all_stdout.append(result.get("stdout", ""))
-            all_stderr.append(result.get("stderr", ""))
+                result = self._run_duplicity(args, passphrase, window=window)
+                total_files += result["files"]
+                total_bytes += result["bytes"]
+                all_errors.extend(result["errors"])
+                all_stdout.append(result.get("stdout", ""))
+                all_stderr.append(result.get("stderr", ""))
+        finally:
+            window.__exit__(None, None, None)
 
         return {
             "files_restored": total_files,

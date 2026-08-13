@@ -40,6 +40,7 @@ source_paths = ["~/Documents", "~/notes"]
 destination = "/mnt/backup/docs"
 # passphrase_file = "~/.config/bu/secrets/docs.pass"   # optional: first line holds the passphrase
 # full_if_older_than = "30D"                           # optional: full backup cadence
+# verbosity = 6                                        # optional: 0-9 (default 6 on TTY, 4 piped)
 {history_file}
 {log_file}
 """
@@ -65,11 +66,35 @@ def _build_backend(dest: DestinationConfig) -> Any:
     return backend_cls(config)
 
 
+def _write_action_header(
+    dest: DestinationConfig,
+    action: str,
+    started: datetime.datetime,
+    restore_to: str | None = None,
+) -> None:
+    """Print a details block before running an action."""
+    out = sys.stdout
+    out.write(f"Action       : {action}\n")
+    out.write(f"Destination  : {dest.name}\n")
+    out.write(f"Method       : {dest.method}\n")
+    if restore_to:
+        out.write(f"Restore to   : {restore_to}\n")
+    else:
+        out.write("Source paths :\n")
+        for sp in dest.source_paths:
+            out.write(f"  {sp}\n")
+        out.write(f"Dest path    : {dest.destination}\n")
+    out.write(f"Started      : {started.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    out.write("\n")
+    out.flush()
+
+
 def action_backup(
     dest: DestinationConfig,
     *,
     dry_run: bool = False,
     extra_args: dict[str, Any] | None = None,
+    scroll_lines: int = 0,
 ) -> dict[str, Any]:
     """Run a backup to the configured destination."""
     start_ts = datetime.datetime.now(datetime.timezone.utc)
@@ -77,8 +102,10 @@ def action_backup(
     logger = ActionLogger(dest.history_file)
     logger.start("backup", dest.name)
 
+    _write_action_header(dest, "backup", start_ts)
+
     backend = _build_backend(dest)
-    result = backend.backup(dest.source_paths, dry_run=dry_run, extra_args=extra_args)
+    result = backend.backup(dest.source_paths, dry_run=dry_run, extra_args=extra_args, scroll_lines=scroll_lines)
 
     # Log any errors from the backend result
     for err in result.get("errors", []):
@@ -169,6 +196,7 @@ def action_restore(
     *,
     dry_run: bool = False,
     extra_args: dict[str, Any] | None = None,
+    scroll_lines: int = 0,
 ) -> dict[str, Any]:
     """Restore files from the configured destination."""
     start_ts = datetime.datetime.now(datetime.timezone.utc)
@@ -176,12 +204,15 @@ def action_restore(
     logger = ActionLogger(dest.history_file)
     logger.start("restore", dest.name)
 
+    _write_action_header(dest, "restore", start_ts, restore_to=restore_path)
+
     backend = _build_backend(dest)
     result = backend.restore(
         restore_path,
         path_within_backup,
         dry_run=dry_run,
         extra_args=extra_args,
+        scroll_lines=scroll_lines,
     )
 
     for err in result.get("errors", []):

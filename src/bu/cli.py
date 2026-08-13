@@ -75,6 +75,16 @@ def _resolve_destination(config_dir: Path | None, destination: str) -> Destinati
         sys.exit(1)
 
 
+def _resolve_window(window_lines: int | None) -> int:
+    """Resolve the live-output window height.
+
+    Defaults to 18 lines when stdout is a TTY, 0 (plain text) otherwise.
+    """
+    if window_lines is not None:
+        return window_lines
+    return 18 if sys.stdout.isatty() else 0
+
+
 @click.group(cls=OrderedGroup, invoke_without_command=True)
 @click.version_option(__version__, "-V", "--version")
 @click.pass_context
@@ -103,12 +113,14 @@ def main(ctx: click.Context) -> None:
 @_JSON
 @_DEST_ARG
 @click.option("--source", "-s", "sources", multiple=True, help="Override source paths (can be repeated).")
+@click.option("--window", "-w", "window_lines", type=int, default=None, help="Confine live output to an N-line window (default: 18 on a TTY, off when piped).")
 def backup(
     config_dir: Path | None,
     dry_run: bool,
     json_output: bool,
     destination: str,
     sources: tuple[str, ...],
+    window_lines: int | None,
 ) -> None:
     """Back up source paths to DESTINATION."""
     dest = _resolve_destination(config_dir, destination)
@@ -117,7 +129,12 @@ def backup(
     if sources:
         extra_args["source_paths"] = list(sources)
 
-    result = action_backup(dest, dry_run=dry_run, extra_args=extra_args or None)
+    result = action_backup(
+        dest,
+        dry_run=dry_run,
+        extra_args=extra_args or None,
+        scroll_lines=_resolve_window(window_lines),
+    )
     click.echo(format_result(result, json_output=json_output))
 
     # Exit non-zero if there were errors
@@ -132,6 +149,7 @@ def backup(
 @_DEST_ARG
 @click.argument("restore_dir", metavar="<RESTORE_DIR>")
 @click.argument("path_within_backup", metavar="[PATH_WITHIN_BACKUP]", required=False, default=None)
+@click.option("--window", "-w", "window_lines", type=int, default=None, help="Confine live output to an N-line window (default: 18 on a TTY, off when piped).")
 def restore(
     config_dir: Path | None,
     dry_run: bool,
@@ -139,6 +157,7 @@ def restore(
     destination: str,
     restore_dir: str,
     path_within_backup: str | None,
+    window_lines: int | None,
 ) -> None:
     """Restore files from DESTINATION into RESTORE_DIR.
 
@@ -152,6 +171,7 @@ def restore(
         restore_dir,
         path_within_backup,
         dry_run=dry_run,
+        scroll_lines=_resolve_window(window_lines),
     )
     click.echo(format_result(result, json_output=json_output))
 
