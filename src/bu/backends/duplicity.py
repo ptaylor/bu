@@ -500,9 +500,14 @@ class DuplicityMethod(Backend):
 
         # Determine which archives to restore
         if path_within_backup:
-            archives = [path_within_backup]
+            # The first component names the archive subdir (source basename);
+            # the remainder is a path within that archive.
+            parts = Path(path_within_backup).parts
+            archives = [parts[0]]
+            inner_path = "/".join(parts[1:]) if len(parts) > 1 else None
         else:
             archives = self._archive_subdirs()
+            inner_path = None
 
         if not archives:
             return {"files_restored": 0, "bytes_restored": 0,
@@ -522,14 +527,16 @@ class DuplicityMethod(Backend):
         try:
             for subdir in archives:
                 # A specific subpath restores into a subdirectory named
-                # after its final component (path 'x/y' → RESTORE_DIR/y);
+                # after its final component (path 'Travel/Paris' → RESTORE_DIR/Paris);
                 # otherwise restore each archive into its own subdirectory.
-                dest_dir = restore_dir / Path(subdir).name if path_within_backup else restore_dir / subdir
+                dest_dir = restore_dir / Path(path_within_backup).name if path_within_backup else restore_dir / subdir
                 if not dry_run:
                     dest_dir.mkdir(parents=True, exist_ok=True)
 
                 args = ["restore"]
                 args.append(f"--verbosity={self._verbosity()}")
+                if inner_path:
+                    args.append(f"--path-to-restore={inner_path}")
                 if sys.stdout.isatty():
                     args.append("--progress")
                 if dry_run:
