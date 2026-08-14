@@ -1,8 +1,9 @@
 """rsync method — copies source directories into a destination subdirectory.
 
 Uses the ``rsync`` binary with sensible flags (archive mode, delete
-extraneous files, human-readable stats).  A ``bu-status.json`` file is
-written into the destination subdirectory to track backup state.
+extraneous files, human-readable stats).  Each source directory is
+mirrored directly into the destination directory, and a
+``bu-<destination>-status.txt`` file records backup state.
 
 Configuration keys required in the .toml file:
     destination: str — base target directory for backups
@@ -23,11 +24,12 @@ from bu.backends.base import Backend, LiveWindow, run_streaming
 
 
 class RsyncMethod(Backend):
-    """Copy source directories to ``<destination>/<name>/`` via rsync.
+    """Mirror source directories directly into the destination directory.
 
-    Uses ``rsync -a --delete`` so the destination is an exact mirror of
-    the sources.  Maintains a ``bu-status.json`` file in the destination
-    subdirectory.
+    Each source ``src`` is copied to ``<destination>/<src.name>`` via
+    ``rsync -a --delete`` so the destination is an exact mirror of the
+    sources.  Maintains a ``bu-<name>-status.txt`` file in the destination
+    directory.
     """
 
     # Default rsync flags used for every backup run.
@@ -39,19 +41,19 @@ class RsyncMethod(Backend):
     ]
 
     def _dest_dir(self) -> Path:
-        """Return ``<destination>/<name>/``."""
+        """Return the destination directory (sources are mirrored directly into it)."""
         base = self.config.get("destination", "")
         if not base:
             raise ValueError("rsync method requires 'destination' in config")
-        name = self.config.get("_name", "unknown")
-        return Path(base).expanduser().resolve() / name
+        return Path(base).expanduser().resolve()
 
     def _status_path(self) -> Path:
-        """Return path to ``bu-status.json`` inside the destination."""
-        return self._dest_dir() / "bu-status.json"
+        """Return path to ``bu-<name>-status.txt`` inside the destination."""
+        name = self.config.get("_name", "unknown")
+        return self._dest_dir() / f"bu-{name}-status.txt"
 
     def _write_status(self, state: str, **extra: Any) -> None:
-        """Write (or overwrite) bu-status.json with the current backup state."""
+        """Write (or overwrite) bu-<name>-status.txt with the current backup state."""
         status: dict[str, Any] = {
             "destination": self.config.get("_name", "unknown"),
             "method": "rsync",
@@ -102,7 +104,7 @@ class RsyncMethod(Backend):
         extra_args: dict[str, Any] | None = None,
         scroll_lines: int = 0,
     ) -> dict[str, Any]:
-        """Run rsync for each source directory into the destination subdir.
+        """Run rsync for each source directory into the destination directory.
 
         Output streams live; with ``scroll_lines`` > 0 it is confined to a
         fixed-height terminal window.
@@ -185,6 +187,8 @@ class RsyncMethod(Backend):
     ) -> dict[str, Any]:
         """Restore files from the backup to ``restore_path`` via rsync.
 
+        With ``path_within_backup`` (e.g. ``x/y``), files are restored
+        into ``RESTORE_DIR/<final component>`` (i.e. ``RESTORE_DIR/y``).
         Never deletes files in the restore destination (no --delete).
         """
         # Validate restore destination
@@ -197,10 +201,14 @@ class RsyncMethod(Backend):
         if errors:
             return {"files_restored": 0, "bytes_restored": 0, "errors": errors}
 
-        # Build source: <dest>/<name>/[path_within_backup]
+        # Build source: <dest>/[path_within_backup]
         src = self._dest_dir()
+        target = restore_dir
         if path_within_backup:
             src = src / path_within_backup
+            # Restore into a subdirectory named after the final path
+            # component, e.g. path 'x/y' restores into RESTORE_DIR/y.
+            target = restore_dir / Path(path_within_backup).name
 
         if not src.exists():
             return {"files_restored": 0, "bytes_restored": 0,
@@ -208,11 +216,12 @@ class RsyncMethod(Backend):
 
         result = self._rsync_one(
             src,
-            restore_dir,
+            target,
             dry_run,
             delete=False,
             scroll_lines=scroll_lines,
             title=f"Restore output — {self.config.get('_name', '?')}",
+            exclude=self._status_path().name,
         )
 
         return {
@@ -244,10 +253,13 @@ class RsyncMethod(Backend):
         scroll_lines: int = 0,
         window: "LiveWindow | None" = None,
         title: str = "Live output",
+        exclude: str | None = None,
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
-        ``delete=False`` keeps the restore non-destructive.
+        ``delete=False`` keeps the restore non-destructive; ``exclude``
+        skips a file/directory name (used to keep the bu status file out
+        of restores).
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
@@ -262,6 +274,8 @@ class RsyncMethod(Backend):
             cmd.append("--progress")
         if delete:
             cmd.append("--delete")
+        if exclude:
+            cmd.append(f"--exclude={exclude}")
         if dry_run:
             cmd.append("--dry-run")
         cmd.append(f"{src}/")
@@ -310,7 +324,7 @@ class RsyncMethod(Backend):
     ) -> dict[str, Any]:
         """Return comprehensive status about this backup destination.
 
-        Checks the config, destination directory, and bu-status.json.
+        Checks the config, destination directory, and bu-<name>-status.txt.
         """
         dest_dir = self._dest_dir()
         name = self.config.get("_name", "unknown")
@@ -335,7 +349,7 @@ class RsyncMethod(Backend):
             })
         result["sources"] = sources_status
 
-        # Read bu-status.json if it exists
+        # Read bu-<name>-status.txt if it exists
         sp = self._status_path()
         if sp.exists():
             try:

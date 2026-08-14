@@ -7,13 +7,18 @@ Actions:
     backup    Back up source paths to the destination
     restore   Restore files into a local directory (never deletes)
     status    Show status and last backup details
+    list      List all configured destinations
     config    Edit a destination configuration in $EDITOR
+    delete    Delete a destination configuration file
     history   Show action history for a destination
     log       Print the raw execution log for a destination
+    encrypt   Encrypt a secret (e.g. B2 credentials) for use in config
+    create    Interactively create a new destination configuration
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,7 +37,7 @@ from bu.actions import (
     format_result,
     format_status,
 )
-from bu.config import Config, ConfigError, DestinationConfig
+from bu.config import Config, ConfigError, DestinationConfig, VALID_NAME_RE
 
 
 class OrderedGroup(click.Group):
@@ -162,7 +167,9 @@ def restore(
     """Restore files from DESTINATION into RESTORE_DIR.
 
     RESTORE_DIR must exist. PATH_WITHIN_BACKUP optionally narrows the
-    restore to a subpath within the backup. Restore never deletes files.
+    restore to a subpath within the backup; its files are restored into
+    RESTORE_DIR/<final component> (e.g. path 'x/y' restores into
+    RESTORE_DIR/y). Restore never deletes files.
     """
     dest = _resolve_destination(config_dir, destination)
 
@@ -195,6 +202,44 @@ def status(
     click.echo(format_status(result, json_output=json_output))
 
 
+@main.command("list")
+@_JSON
+def list_destinations(json_output: bool) -> None:
+    """List all configured destinations.
+
+    Shows every destination (backup config) with its method and target.
+    """
+    try:
+        cfg = Config()
+        dests = cfg.list_destinations()
+    except ConfigError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    rows: list[dict[str, str]] = []
+    for name in dests:
+        try:
+            d = cfg.get(name)
+            rows.append({"name": name, "method": d.method, "destination": d.destination})
+        except ConfigError as e:
+            rows.append({"name": name, "method": "invalid", "destination": "", "error": str(e)})
+
+    if json_output:
+        click.echo(json.dumps(rows, indent=2))
+        return
+
+    if not rows:
+        click.echo("No destinations configured.")
+        click.echo("Run 'bu create' to configure one.")
+        return
+
+    for r in rows:
+        if r.get("error"):
+            click.echo(f"{r['name']:<24} <invalid config: {r['error']}>")
+        else:
+            click.echo(f"{r['name']:<24} {r['method']:<10} {r['destination']}")
+
+
 @main.command()
 @_CONFIG_OPTIONAL
 @_JSON
@@ -221,6 +266,62 @@ def config(
 
     if not result.get("ok"):
         sys.exit(1)
+
+
+@main.command()
+@_CONFIG_OPTIONAL
+@click.argument("destination", metavar="<DESTINATION>")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def delete(config_dir: Path | None, destination: str, yes: bool) -> None:
+    """Delete the DESTINATION config file.
+
+    Only the .toml config is removed — the backup contents at the
+    destination are NOT deleted.
+    """
+    cfg = _load_config(config_dir)
+
+    if not VALID_NAME_RE.match(destination):
+        click.echo(
+            f"Error: Invalid destination name {destination!r} — names may only "
+            "contain letters, digits, '-' and '_'.",
+            err=True,
+        )
+        sys.exit(1)
+
+    file_path = cfg.config_dir / f"{destination}.toml"
+    if not file_path.exists():
+        available = ", ".join(cfg.list_destinations()) or "(none)"
+        click.echo(
+            f"Error: No config found for {destination!r}. "
+            f"Available destinations: {available}",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Best-effort: find where the backup contents live for the warning.
+    dest_path: str | None = None
+    try:
+        dest_path = cfg.get(destination).destination
+    except ConfigError:
+        pass
+
+    click.echo("Warning: this deletes only the config file — the backup contents are NOT deleted.")
+    if not yes:
+        try:
+            confirmed = click.confirm(f"Delete config for {destination!r}?", default=False)
+        except click.exceptions.Abort:
+            click.echo("Aborted.")
+            sys.exit(1)
+        if not confirmed:
+            click.echo("Aborted.")
+            sys.exit(1)
+
+    file_path.unlink()
+    click.echo(f"Deleted: {file_path}")
+    if dest_path:
+        click.echo(f"Warning: backup contents at {dest_path!r} were NOT deleted.")
+    else:
+        click.echo("Warning: backup contents were NOT deleted.")
 
 
 @main.command()
@@ -263,3 +364,63 @@ def log(
         click.echo(f"Error: {result.get('errors', ['unknown error'])[0]}", err=True)
         sys.exit(1)
     click.echo(result["content"], nl=False)
+
+
+@main.command()
+def encrypt() -> None:
+    """Encrypt a secret for use in a config file.
+
+    Prompts (hidden input) for the secret and a password, then prints an
+    armored GPG blob. Paste it into a config as e.g. b2_account_id_enc
+    or b2_account_key_enc; bu prompts for the password when it is needed.
+    """
+    import getpass
+
+    from bu.crypto import CryptoError, encrypt_secret
+
+    secret = getpass.getpass("Secret to encrypt: ")
+    if not secret:
+        click.echo("Error: empty secret", err=True)
+        sys.exit(1)
+    password = getpass.getpass("Encryption password: ")
+    if not password:
+        click.echo("Error: empty password", err=True)
+        sys.exit(1)
+
+    try:
+        blob = encrypt_secret(secret, password)
+    except CryptoError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(blob)
+
+
+@main.command()
+@_CONFIG_OPTIONAL
+@click.argument("name", metavar="[NAME]", required=False, default=None)
+def create(config_dir: Path | None, name: str | None) -> None:
+    """Interactively create a new destination configuration.
+
+    A guided wizard prompts for the destination name (unless NAME is
+    given), method, source paths, destination, and method-specific
+    options (B2 credentials, GPG passphrase).  Invalid answers are
+    rejected and re-prompted; choices use numbered, arrow-key menus.
+    """
+    from bu.wizard import run_create_wizard
+
+    try:
+        result = run_create_wizard(config_dir, name=name)
+    except (EOFError, KeyboardInterrupt):
+        click.echo("\nAborted.")
+        sys.exit(1)
+
+    click.echo()
+    click.echo(f"Created: {result['file']}")
+    d = result["destination"]
+    click.echo(f"Destination : {d['name']}")
+    click.echo(f"Method      : {d['method']}")
+    click.echo(f"Path        : {d['path']}")
+    click.echo("Source paths:")
+    for sp in d["source_paths"]:
+        click.echo(f"  {sp}")

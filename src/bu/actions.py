@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,14 +21,18 @@ else:
     import tomli as tomllib
 
 from bu.backends import get_backend
-from bu.config import Config, ConfigError, DestinationConfig
+from bu.backends.duplicity import condense_stderr
+from bu.config import Config, ConfigError, DestinationConfig, VALID_NAME_RE
 from bu.logging import ActionLogger, group_entries, read_log
 
 # Per-method sample configs used when creating a new destination file.
 _SAMPLE_RSYNC = """\
 # rsync method — copies files to a local directory
 method = "rsync"
-source_paths = ["~/Documents", "~/notes"]
+source_paths = [
+    "~/Documents",
+    "~/notes",
+]
 destination = "/mnt/backup/docs"
 {history_file}
 {log_file}
@@ -36,11 +41,19 @@ destination = "/mnt/backup/docs"
 _SAMPLE_DUPLICITY = """\
 # duplicity method — encrypted, incremental backup archives
 method = "duplicity"
-source_paths = ["~/Documents", "~/notes"]
-destination = "/mnt/backup/docs"
+source_paths = [
+    "~/Documents",
+    "~/notes",
+]
+destination = "/mnt/backup/docs"            # or "b2://bucket-name/path"
 # passphrase_file = "~/.config/bu/secrets/docs.pass"   # optional: first line holds the passphrase
 # full_if_older_than = "30D"                           # optional: full backup cadence
 # verbosity = 6                                        # optional: 0-9 (default 6 on TTY, 4 piped)
+#
+# Backblaze B2 credentials (needed when destination starts with b2://):
+#   Plaintext:  b2_account_id = "..."   b2_account_key = "..."
+#   Encrypted:  b2_account_id_enc = "<gpg armored>"  b2_account_key_enc = "<gpg armored>"
+#               (use 'bu encrypt' to create armored blobs; password is prompted on use)
 {history_file}
 {log_file}
 """
@@ -48,7 +61,9 @@ destination = "/mnt/backup/docs"
 _SAMPLE_GENERIC = """\
 # bu destination configuration
 # method = "rsync"   # or "duplicity"
-# source_paths = ["/path/to/backup"]
+# source_paths = [
+#     "/path/to/backup",
+# ]
 # destination = "/path/to/backup/location"
 {history_file}
 {log_file}
@@ -89,6 +104,65 @@ def _write_action_header(
     out.flush()
 
 
+def _format_duration(elapsed: datetime.timedelta) -> str:
+    """Format a timedelta as H:MM:SS (dropping hours when zero)."""
+    total = int(elapsed.total_seconds())
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _write_backup_summary(
+    dest: DestinationConfig,
+    result: dict[str, Any],
+    dry_run: bool,
+    elapsed: datetime.timedelta,
+) -> None:
+    """Print a source → destination summary after a backup finishes."""
+    out = sys.stdout
+    if result.get("errors"):
+        status = "failed"
+    elif dry_run:
+        status = "dry-run"
+    else:
+        status = "success"
+
+    label_width = 11  # fits "Destination"
+    indent = " " * (2 + label_width + 2)
+
+    def row(label: str, value: str) -> None:
+        out.write(f"  {label:<{label_width}}: {value}\n")
+
+    out.write("\nBackup summary\n")
+    sources = dest.source_paths
+    for i, sp in enumerate(sources):
+        if i == 0:
+            row("Sources", sp)
+        else:
+            out.write(f"{indent}{sp}\n")
+    row("Destination", dest.destination)
+    row("Status", status)
+    row("Duration", _format_duration(elapsed))
+
+    files = result.get("files_copied", 0)
+    bytes_copied = result.get("bytes_copied", 0)
+    if files or bytes_copied:
+        detail = f"{files} files"
+        if bytes_copied:
+            detail += f", {_format_size(bytes_copied)}"
+        row("Copied", detail)
+
+    errors = result.get("errors", [])
+    if errors:
+        row("Errors", str(len(errors)))
+        for err in errors:
+            out.write(f"{indent}{err}\n")
+    out.write("\n")
+    out.flush()
+
+
 def action_backup(
     dest: DestinationConfig,
     *,
@@ -120,6 +194,10 @@ def action_backup(
 
     # Write raw execution log
     _write_raw_log(dest, "backup", start_ts, result)
+
+    # Print a source → destination summary after the backup
+    end_ts = datetime.datetime.now(datetime.timezone.utc)
+    _write_backup_summary(dest, result, dry_run, elapsed=end_ts - start_ts)
 
     return result
 
@@ -181,7 +259,11 @@ def _write_raw_log(
     if stderr:
         lines.append(f"{'-'*40}")
         lines.append("--- stderr ---")
-        lines.append(stderr)
+        if dest.method == "duplicity":
+            # Tracebacks are condensed to single lines in the log too.
+            lines.extend(condense_stderr(stderr))
+        else:
+            lines.append(stderr)
 
     lines.append("")
 
@@ -340,6 +422,17 @@ def action_config(
                         "Run 'bu config <name> --method rsync|duplicity' to create one.",
             }
 
+    # Validate the destination name before touching the filesystem
+    if not VALID_NAME_RE.match(destination):
+        return {
+            "ok": False,
+            "destination": destination,
+            "errors": [
+                f"Invalid destination name {destination!r} — names may only "
+                "contain letters, digits, '-' and '_'."
+            ],
+        }
+
     # Determine the file path for this destination
     file_path = cfg_dir / f"{destination}.toml"
 
@@ -433,6 +526,35 @@ def action_config(
             "created": created,
             "file": str(file_path),
             "errors": ["Missing required 'destination' key (backup target path)."],
+        }
+
+    # Catch common destination/method mismatches
+    url_match = re.match(r"^\w{2,}://", raw_dest)     # proper URL like b2://…
+    scheme_match = re.match(r"^\w{2,}:", raw_dest)    # any scheme-like prefix
+
+    if raw_method == "rsync" and scheme_match:
+        return {
+            "ok": False,
+            "destination": destination,
+            "created": created,
+            "file": str(file_path),
+            "errors": [
+                f"Destination {raw_dest!r} looks like a remote URL, but "
+                "method = 'rsync' only copies to local directories. "
+                "Use method = 'duplicity' for remote targets (e.g. b2://bucket/path)."
+            ],
+        }
+
+    if raw_method == "duplicity" and scheme_match and not url_match:
+        return {
+            "ok": False,
+            "destination": destination,
+            "created": created,
+            "file": str(file_path),
+            "errors": [
+                f"Destination {raw_dest!r} looks like a malformed URL. "
+                "URLs need '://' — e.g. b2://bucket-name/path."
+            ],
         }
 
     # Build a DestinationConfig directly from the parsed data so we

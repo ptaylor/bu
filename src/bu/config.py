@@ -29,6 +29,7 @@ Override with the optional ``history_file`` and ``log_file`` keys, or set
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,9 @@ _RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_fi
 
 # Valid method names.
 _VALID_METHODS = frozenset({"rsync", "duplicity"})
+
+# Destination names may contain only letters, digits, underscore, dash.
+VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _default_state_dir() -> Path:
@@ -191,8 +195,13 @@ class Config:
     def get(self, name: str) -> DestinationConfig:
         """Return configuration for a named destination.
 
-        Raises ConfigError if not found.
+        Raises ConfigError if the name is invalid or not found.
         """
+        if not VALID_NAME_RE.match(name):
+            raise ConfigError(
+                f"Invalid destination name {name!r} — names may only contain "
+                "letters, digits, '-' and '_'."
+            )
         if name not in self.destinations:
             available = ", ".join(sorted(self.destinations.keys())) or "(none)"
             raise ConfigError(

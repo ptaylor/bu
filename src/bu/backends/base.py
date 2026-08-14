@@ -30,6 +30,8 @@ class LiveWindow:
     colour-coded (errors red, warnings yellow, progress cyan, dirs blue).
     A status line below the window shows the latest output row plus
     elapsed time, repainted at most every ``status_interval`` seconds.
+    A yellow ``─`` dividing rule sits between the window rows and the
+    status line, matching the title bar.
     Auto-disabled when stdout is not a TTY (plain passthrough).
     """
 
@@ -65,9 +67,9 @@ class LiveWindow:
         # Title bar above the window: "── Title ──────…"
         rule = "─" * max(0, self._width - len(self.title) - 3)
         sys.stdout.write(f"\033[1;33m─ {self.title} {rule}\033[0m\r\n")
-        # Reserve window + status rows, then move cursor back to the top
-        sys.stdout.write("\n" * (self.lines + 1))
-        sys.stdout.write(f"\033[{self.lines + 1}A")
+        # Reserve window + dividing rule + status rows, then move cursor back
+        sys.stdout.write("\n" * (self.lines + 2))
+        sys.stdout.write(f"\033[{self.lines + 2}A")
         sys.stdout.flush()
         self._start = time.monotonic()
         self._last_status_paint = -1.0
@@ -78,10 +80,8 @@ class LiveWindow:
         if self.active:
             with self._lock:
                 self._redraw()
-                # Move below the window + status row so the final
-                # summary prints on a fresh line.
-                if self._painted < self.lines:
-                    sys.stdout.write(f"\033[{self.lines - self._painted}B")
+                # The cursor sits on the status row after a redraw;
+                # move below it so the final summary prints fresh.
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 self.active = False
@@ -126,17 +126,20 @@ class LiveWindow:
         return row
 
     def _redraw(self) -> None:
-        # Move cursor up to the top of the painted area
+        # Move cursor up to the first output row of the window block.
         if self._painted:
-            sys.stdout.write(f"\033[{self._painted}A")
-        for row in self._buf:
+            sys.stdout.write(f"\033[{self._painted + 1}A")
+        # Always paint exactly `lines` output rows (blank-filling the rest)
+        for i in range(self.lines):
             sys.stdout.write("\033[2K")       # erase whole line
-            sys.stdout.write(self._colour_row(row[: self._width - 1]))
+            if i < len(self._buf):
+                sys.stdout.write(self._colour_row(self._buf[i][: self._width - 1]))
             sys.stdout.write("\n")
-        # Clear any leftover previously-painted lines
-        for _ in range(self._painted - len(self._buf)):
-            sys.stdout.write("\033[2K\n")
-        self._painted = len(self._buf)
+        self._painted = self.lines
+        # Yellow dividing rule above the status line, matching the title bar
+        sys.stdout.write("\033[2K")
+        sys.stdout.write(f"\033[1;33m{'─' * self._width}\033[0m")
+        sys.stdout.write("\n")
         # Status line below the window — throttled to update infrequently
         now = time.monotonic()
         if self._last_status_paint < 0 or now - self._last_status_paint >= self.status_interval:
@@ -154,6 +157,7 @@ def run_streaming(
     scroll_lines: int = 0,
     window: "LiveWindow | None" = None,
     title: str = "Live output",
+    silence_stderr: bool = False,
 ) -> StreamResult:
     """Run a command, streaming its output live to the terminal while capturing.
 
@@ -164,12 +168,14 @@ def run_streaming(
 
     If ``window`` is supplied, it is used instead of creating one — the
     caller owns its lifecycle (useful for sharing one window across
-    several subprocess runs).
+    several subprocess runs).  ``silence_stderr`` captures stderr without
+    writing it anywhere (the caller can re-emit condensed lines later).
     Return a StreamResult with combined output strings.
     """
     owns_window = window is None
     if window is None:
         window = LiveWindow(scroll_lines, title=title)
+    stderr_window = None if silence_stderr else window
     if owns_window:
         window.__enter__()
     try:
@@ -193,8 +199,9 @@ def run_streaming(
                     chunk = stream.read(4096)
                     if not chunk:
                         break
-                    target.write(chunk)
-                    target.flush()
+                    if target is not None:
+                        target.write(chunk)
+                        target.flush()
                     bucket.append(chunk)
             except (UnicodeDecodeError, ValueError, OSError):
                 # Binary/garbled output — skip rather than crash the thread
@@ -203,7 +210,7 @@ def run_streaming(
                 stream.close()
 
         t1 = threading.Thread(target=_tee, args=(proc.stdout, window, captured["stdout"]))
-        t2 = threading.Thread(target=_tee, args=(proc.stderr, window, captured["stderr"]))
+        t2 = threading.Thread(target=_tee, args=(proc.stderr, stderr_window, captured["stderr"]))
         t1.start()
         t2.start()
         t1.join()
@@ -257,8 +264,9 @@ class Backend(ABC):
         """Restore files from the backup into ``restore_path``.
 
         ``path_within_backup`` optionally narrows the restore to a
-        subpath within the backup.  Must never delete files in the
-        restore destination.
+        subpath within the backup; its files are restored into
+        ``RESTORE_DIR/<final component of path_within_backup>``.
+        Must never delete files in the restore destination.
 
         Returns a dict with files_restored, bytes_restored, etc.
         """

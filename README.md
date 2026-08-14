@@ -8,7 +8,7 @@ Backup utility using rsync (and eventually duplicity) to mirror directories.
 bu <ACTION> <DESTINATION> [OPTIONS...]
 ```
 
-- **`<ACTION>`** — one of: `backup`, `status`, `config`, `history`
+- **`<ACTION>`** — one of: `backup`, `restore`, `status`, `list`, `config`, `history`, `log`, `encrypt`, `create`
 - **`<DESTINATION>`** — a named destination defined in the configuration
 - **`[OPTIONS]`** — action-specific flags
 
@@ -17,9 +17,15 @@ bu <ACTION> <DESTINATION> [OPTIONS...]
 | Command | Description |
 |---------|-------------|
 | `bu backup <DEST>` | Mirror source directories to the destination via rsync |
+| `bu restore <DEST> <RESTORE_DIR> [PATH]` | Restore files into a local directory (never deletes) |
 | `bu status <DEST>` | Show config, destination state, and last backup details |
+| `bu list` | List all configured destinations |
 | `bu config [<DEST>]` | Edit (or create) a destination config in `$EDITOR` |
+| `bu delete <DEST>` | Delete a destination config file (contents are kept) |
+| `bu create [NAME]` | Interactively create a new destination config |
 | `bu history <DEST>` | Show action history in reverse chronological order |
+| `bu log <DEST>` | Print the raw execution log |
+| `bu encrypt` | Encrypt a secret (e.g. B2 credentials) for use in config |
 
 Common options: `--dry-run` (`-n`), `--json`, `--config <DIR>`.
 
@@ -43,7 +49,7 @@ log_file = "/home/paul/.local/state/bu/logs/photos.log"
 |-----|----------|-------------|
 | `method` | Yes | `"rsync"` or `"duplicity"` |
 | `source_paths` | Yes | Array of directory paths to back up |
-| `destination` | Yes | Base target directory (files go to `<dest>/<name>/`) |
+| `destination` | Yes | Base target directory (files are mirrored directly into it) |
 | `history_file` | No | Path to structured JSON-lines action history |
 | `log_file` | No | Path to raw execution log |
 

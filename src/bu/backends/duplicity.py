@@ -1,6 +1,7 @@
 """duplicity method — encrypted incremental backups via the duplicity CLI.
 
-Backs up to a local ``file://`` target: ``<destination>/<name>``.
+Backs up to a local ``file://`` target: ``<destination>/<source name>``
+(one archive subdirectory per source, like the rsync method).
 
 Passphrase resolution order (backup and restore):
     1. ``passphrase_file`` key in the .toml — file containing the passphrase
@@ -17,7 +18,9 @@ Configuration keys:
 
 from __future__ import annotations
 
+import datetime
 import getpass
+import json
 import os
 import re
 import subprocess
@@ -26,6 +29,67 @@ from pathlib import Path
 from typing import Any
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
+from bu.crypto import CryptoError, decrypt_secret
+
+
+def condense_stderr(stderr: str) -> list[str]:
+    """Condense duplicity's multi-line stderr into single-line error messages.
+
+    Each "Error processing remote file (...)" block is followed by a long
+    Python traceback; every block is reduced to one line.  GPG passphrase
+    failures become a single friendly line instead of a 30-line traceback.
+    """
+    lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    if len(lines) == 1:
+        return lines
+
+    # Split into blocks, one per "Error processing remote file (...)" line.
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for ln in lines:
+        if ln.startswith("Error processing"):
+            if current:
+                blocks.append(current)
+            current = [ln]
+        else:
+            current.append(ln)
+    if current:
+        blocks.append(current)
+
+    summaries: list[str] = []
+    for block in blocks:
+        text = "\n".join(block)
+        first = block[0] if block else ""
+        if "Bad session key" in text:
+            summaries.append(
+                "GPG decryption failed: Bad session key — is the passphrase correct?"
+            )
+        elif "GPG Failed" in text:
+            summaries.append("GPG decryption failed — is the passphrase correct?")
+        elif first.startswith("Traceback"):
+            summaries.append("duplicity failed with an internal error (see the log for details).")
+        elif first.startswith("Error processing remote file ("):
+            # Single line, but drop the long timestamped archive filename.
+            m = re.match(r"^Error processing remote file \(([^)]*)\):\s*(.*)$", first)
+            if m and m.group(2):
+                summaries.append(f"Error processing remote file ({m.group(1)}): {m.group(2)}")
+            elif m:
+                summaries.append(f"Error processing remote file ({m.group(1)}).")
+            else:
+                summaries.append(first)
+        else:
+            summaries.append(first)
+
+    # Deduplicate repeated identical messages (one per failed file).
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in summaries:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 class DuplicityMethod(Backend):
@@ -36,21 +100,59 @@ class DuplicityMethod(Backend):
     # ------------------------------------------------------------------
 
     def _target_url(self, subdir: str | None = None) -> str:
-        """Return the duplicity target URL: ``file://<destination>/<name>[/<subdir>]``."""
-        if not self.config.get("destination"):
+        """Return the duplicity target URL.
+
+        If ``destination`` is a full URL (e.g. ``b2://bucket/path``) it is
+        used as-is; otherwise it is treated as a local path:
+        ``file://<destination>[/<subdir>]``.
+        """
+        destination = self.config.get("destination", "")
+        if not destination:
             raise ValueError("duplicity method requires 'destination' in config")
-        base = Path(self.config["destination"]).expanduser().resolve()
+        if "://" in destination:
+            url = destination.rstrip("/")
+            return f"{url}/{subdir}" if subdir else url
+        base = Path(destination).expanduser().resolve()
+        return f"file://{base / subdir}" if subdir else f"file://{base}"
+
+    def _is_b2(self) -> bool:
+        """True when the destination is a Backblaze B2 URL."""
+        return self.config.get("destination", "").startswith("b2://")
+
+    def _status_path(self) -> Path:
+        """Return the status file path.
+
+        Local targets: ``<destination>/bu-<name>-status.txt`` — the same
+        strategy as the rsync method.  Remote (B2) targets have no local
+        destination, so the file lives under the state directory instead.
+        """
         name = self.config.get("_name", "unknown")
-        parts = [base, name]
-        if subdir:
-            parts.append(subdir)
-        return f"file://{Path(*parts)}"
+        if self._is_b2():
+            from bu.config import _default_state_dir
+
+            return _default_state_dir() / "status" / f"bu-{name}-status.txt"
+        base = Path(self.config.get("destination", "")).expanduser().resolve()
+        return base / f"bu-{name}-status.txt"
+
+    def _write_status(self, state: str, **extra: Any) -> None:
+        """Write (or overwrite) bu-<name>-status.txt with the current backup state."""
+        status: dict[str, Any] = {
+            "destination": self.config.get("_name", "unknown"),
+            "method": "duplicity",
+            "source_paths": self.config.get("_source_paths", []),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "state": state,
+        }
+        status.update(extra)
+        path = self._status_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(status, fh, indent=2, default=str)
 
     def _archive_subdirs(self) -> list[str]:
         """List archive subdirectories under the destination (one per source)."""
         base = Path(self.config.get("destination", "")).expanduser().resolve()
-        name = self.config.get("_name", "unknown")
-        root = base / name
+        root = base
         if not root.is_dir():
             return []
         return sorted(p.name for p in root.iterdir() if p.is_dir())
@@ -101,6 +203,64 @@ class DuplicityMethod(Backend):
 
         return None
 
+    def _b2_credentials(self) -> tuple[str, str] | None:
+        """Resolve Backblaze B2 credentials, or None when not configured.
+
+        Resolution order:
+            1. Plaintext ``b2_account_id`` + ``b2_account_key`` config keys
+            2. Encrypted ``b2_account_id_enc`` + ``b2_account_key_enc`` keys
+               (prompts for the password via getpass)
+            3. ``B2_ACCOUNT_ID`` / ``B2_APPLICATION_KEY`` environment vars
+        """
+        name = self.config.get("_name", "unknown")
+
+        # 1. Plaintext in config
+        aid = self.config.get("b2_account_id", "")
+        akey = self.config.get("b2_account_key", "")
+        if aid and akey:
+            return aid, akey
+
+        # 2. Encrypted in config — prompt for password
+        aid_enc = self.config.get("b2_account_id_enc", "")
+        akey_enc = self.config.get("b2_account_key_enc", "")
+        if aid_enc or akey_enc:
+            if not sys.stdin.isatty():
+                raise ValueError(
+                    f"Encrypted B2 credentials for {name!r} need an "
+                    "interactive terminal to prompt for the password."
+                )
+            pw = getpass.getpass(f"Password for B2 credentials of '{name}': ")
+            try:
+                aid = decrypt_secret(aid_enc, pw) if aid_enc else ""
+                akey = decrypt_secret(akey_enc, pw) if akey_enc else ""
+            except CryptoError as e:
+                raise ValueError(f"Failed to decrypt B2 credentials: {e}") from e
+            return aid, akey
+
+        # 3. Environment fallback
+        env_aid = os.environ.get("B2_ACCOUNT_ID", "")
+        env_akey = os.environ.get("B2_APPLICATION_KEY", "")
+        if env_aid and env_akey:
+            return env_aid, env_akey
+
+        return None
+
+    def _b2_env(self) -> tuple[dict[str, str], list[str]]:
+        """Return (env, errors) with B2 credentials if the target is B2."""
+        if not self._is_b2():
+            return {}, []
+        try:
+            creds = self._b2_credentials()
+        except ValueError as e:
+            return {}, [str(e)]
+        if not creds:
+            return {}, [
+                "Backblaze B2 destination requires credentials: set "
+                "b2_account_id/b2_account_key (or the _enc variants) in "
+                "the config, or B2_ACCOUNT_ID/B2_APPLICATION_KEY env vars."
+            ]
+        return {"B2_ACCOUNT_ID": creds[0], "B2_APPLICATION_KEY": creds[1]}, []
+
     def _run_duplicity(
         self,
         args: list[str],
@@ -108,9 +268,12 @@ class DuplicityMethod(Backend):
         scroll_lines: int = 0,
         window: "LiveWindow | None" = None,
         title: str = "Live output",
+        extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Run the duplicity CLI.  Returns ``{files, bytes, errors, stdout, stderr}``."""
         env = dict(os.environ)
+        if extra_env:
+            env.update(extra_env)
         if passphrase is not None:
             env["PASSPHRASE"] = passphrase
         else:
@@ -118,7 +281,12 @@ class DuplicityMethod(Backend):
 
         cmd = ["duplicity"] + args
         try:
-            proc = run_streaming(cmd, env=env, scroll_lines=scroll_lines, window=window, title=title)
+            # stderr is captured silently — duplicity's tracebacks are
+            # condensed into single-line errors and re-emitted below.
+            proc = run_streaming(
+                cmd, env=env, scroll_lines=scroll_lines, window=window,
+                title=title, silence_stderr=True,
+            )
         except FileNotFoundError:
             return {"files": 0, "bytes": 0,
                     "errors": ["duplicity binary not found. Is it installed?"],
@@ -126,9 +294,11 @@ class DuplicityMethod(Backend):
 
         errors: list[str] = []
         if proc.returncode != 0:
-            stderr = proc.stderr.strip()
-            if stderr:
-                errors.append(stderr)
+            errors.extend(condense_stderr(proc.stderr))
+            # Show the condensed lines in the live window (if one is active)
+            if window is not None and window.active:
+                for line in errors:
+                    window.write(line + "\n")
 
         # Parse the "[ Backup Statistics ]" section
         files = self._parse_duplicity_stat(proc.stdout, "NewFiles")
@@ -200,12 +370,13 @@ class DuplicityMethod(Backend):
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}
 
-        # Validate destination
-        base = Path(self.config.get("destination", "")).expanduser()
-        if not base.exists():
-            errors.append(f"Destination not found: {base}")
-        elif not base.is_dir():
-            errors.append(f"Destination is not a directory: {base}")
+        # Validate destination (local paths only — URLs like b2:// skip this)
+        if not self._is_b2():
+            base = Path(self.config.get("destination", "")).expanduser()
+            if not base.exists():
+                errors.append(f"Destination not found: {base}")
+            elif not base.is_dir():
+                errors.append(f"Destination is not a directory: {base}")
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}
 
@@ -216,6 +387,14 @@ class DuplicityMethod(Backend):
                 passphrase = self._resolve_passphrase()
             except ValueError as e:
                 return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": [str(e)]}
+
+        # B2 credentials if targeting Backblaze
+        b2_env, b2_errors = self._b2_env()
+        if b2_errors:
+            return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": b2_errors}
+
+        if not dry_run:
+            self._write_status("started")
 
         # duplicity 3.x takes exactly one source per invocation, so run
         # once per source into its own archive subdirectory.
@@ -255,7 +434,7 @@ class DuplicityMethod(Backend):
                 args.append(str(src))
                 args.append(self._target_url(candidate))
 
-                result = self._run_duplicity(args, passphrase, window=window)
+                result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
@@ -263,6 +442,21 @@ class DuplicityMethod(Backend):
                 all_stderr.append(result.get("stderr", ""))
         finally:
             window.__exit__(None, None, None)
+
+        if not dry_run:
+            if all_errors:
+                self._write_status(
+                    "error",
+                    files_copied=total_files,
+                    bytes_copied=total_bytes,
+                    errors=all_errors,
+                )
+            else:
+                self._write_status(
+                    "completed",
+                    files_copied=total_files,
+                    bytes_copied=total_bytes,
+                )
 
         return {
             "files_copied": total_files,
@@ -299,6 +493,11 @@ class DuplicityMethod(Backend):
         except ValueError as e:
             return {"files_restored": 0, "bytes_restored": 0, "errors": [str(e)]}
 
+        # B2 credentials if targeting Backblaze
+        b2_env, b2_errors = self._b2_env()
+        if b2_errors:
+            return {"files_restored": 0, "bytes_restored": 0, "errors": b2_errors}
+
         # Determine which archives to restore
         if path_within_backup:
             archives = [path_within_backup]
@@ -322,9 +521,10 @@ class DuplicityMethod(Backend):
         window.__enter__()
         try:
             for subdir in archives:
-                # With a specific subpath restore directly into restore_dir;
+                # A specific subpath restores into a subdirectory named
+                # after its final component (path 'x/y' → RESTORE_DIR/y);
                 # otherwise restore each archive into its own subdirectory.
-                dest_dir = restore_dir if path_within_backup else restore_dir / subdir
+                dest_dir = restore_dir / Path(subdir).name if path_within_backup else restore_dir / subdir
                 if not dry_run:
                     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -337,7 +537,7 @@ class DuplicityMethod(Backend):
                 args.append(self._target_url(subdir))
                 args.append(str(dest_dir))
 
-                result = self._run_duplicity(args, passphrase, window=window)
+                result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
@@ -360,18 +560,30 @@ class DuplicityMethod(Backend):
         *,
         extra_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        base = Path(self.config.get("destination", "")).expanduser()
         name = self.config.get("_name", "unknown")
         source_paths = self.config.get("_source_paths", [])
+        is_b2 = self._is_b2()
 
-        result: dict[str, Any] = {
-            "destination": name,
-            "method": "duplicity",
-            "config_ok": True,
-            "source_paths": source_paths,
-            "dest_path": str(base / name),
-            "dest_exists": (base / name).is_dir(),
-        }
+        if is_b2:
+            base = Path("")
+            result: dict[str, Any] = {
+                "destination": name,
+                "method": "duplicity",
+                "config_ok": True,
+                "source_paths": source_paths,
+                "dest_path": self.config.get("destination", ""),
+                "dest_exists": None,  # remote — not checked locally
+            }
+        else:
+            base = Path(self.config.get("destination", "")).expanduser()
+            result = {
+                "destination": name,
+                "method": "duplicity",
+                "config_ok": True,
+                "source_paths": source_paths,
+                "dest_path": str(base),
+                "dest_exists": base.is_dir(),
+            }
 
         # Source existence checks
         sources_status: list[dict[str, Any]] = []
@@ -384,10 +596,35 @@ class DuplicityMethod(Backend):
         passphrase = self._non_interactive_passphrase()
         result["passphrase_ready"] = passphrase is not None
 
+        # B2 status: never prompt, use only non-interactive credential sources
+        b2_env: dict[str, str] = {}
+        if is_b2:
+            aid = self.config.get("b2_account_id", "") or os.environ.get("B2_ACCOUNT_ID", "")
+            akey = self.config.get("b2_account_key", "") or os.environ.get("B2_APPLICATION_KEY", "")
+            if aid and akey:
+                b2_env = {"B2_ACCOUNT_ID": aid, "B2_APPLICATION_KEY": akey}
+            else:
+                result["passphrase_ready"] = False
+
         # Collection status per archive, if backup exists and passphrase known
-        archives = self._archive_subdirs()
+        archives = [] if is_b2 else self._archive_subdirs()
         result["archives"] = archives
-        if archives and passphrase:
+
+        if is_b2:
+            # Single collection-status on the base B2 URL
+            if passphrase and b2_env:
+                r = self._run_duplicity(
+                    ["collection-status", self._target_url()], passphrase, extra_env=b2_env,
+                )
+                result["last_backup"] = {
+                    "state": "error" if r["errors"] else "completed",
+                    "timestamp": "",
+                    "output": r.get("stdout", "").strip()[:500],
+                    "errors": r["errors"],
+                }
+            else:
+                result["last_backup"] = None
+        elif archives and passphrase:
             combined_output: list[str] = []
             combined_errors: list[str] = []
             for subdir in archives:
@@ -405,6 +642,16 @@ class DuplicityMethod(Backend):
             }
         else:
             result["last_backup"] = None
+
+        # Fall back to the written status file when collection-status
+        # produced nothing (e.g. no passphrase available non-interactively).
+        if not result.get("last_backup"):
+            sp = self._status_path()
+            if sp.exists():
+                try:
+                    result["last_backup"] = json.loads(sp.read_text())
+                except (json.JSONDecodeError, OSError):
+                    pass
 
         return result
 
