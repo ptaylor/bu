@@ -37,7 +37,7 @@ from bu.actions import (
     format_result,
     format_status,
 )
-from bu.config import Config, ConfigError, DestinationConfig, VALID_NAME_RE
+from bu.config import VALID_NAME_RE, Config, ConfigError, DestinationConfig
 
 
 class OrderedGroup(click.Group):

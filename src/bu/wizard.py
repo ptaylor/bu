@@ -6,7 +6,9 @@ duplicity-only for B2) → source paths → duplicity-specific options.
 Every answer is validated and re-prompted until it is correct.
 
 Choice menus are numbered and arrow-key scrollable when running on a TTY;
-when piped, they fall back to plain numbered input.
+when piped, they fall back to plain numbered input.  On a TTY the wizard
+uses ANSI colors, step headers, and colored prompts; piped output is plain
+(no escape sequences).
 """
 
 from __future__ import annotations
@@ -20,24 +22,57 @@ import tty
 from pathlib import Path
 from typing import Any
 
-from bu.config import Config, VALID_NAME_RE, _default_history_dir, _default_raw_log_dir
+from bu.config import VALID_NAME_RE, Config, _default_history_dir, _default_raw_log_dir
 from bu.crypto import CryptoError, encrypt_secret
+
+# ----------------------------------------------------------------------
+# ANSI styling — automatically disabled when output is not a TTY
+# ----------------------------------------------------------------------
+
+_COLOR = sys.stdout.isatty()
+
+_ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "red": "\033[31m",
+    "green": "\033[32m",
+    "yellow": "\033[33m",
+    "cyan": "\033[36m",
+}
+
+
+def _paint(color: str, text: str) -> str:
+    """Wrap ``text`` in an ANSI color when stdout is a TTY."""
+    if not _COLOR:
+        return text
+    return f"{_ANSI[color]}{text}{_ANSI['reset']}"
+
+
+def _error(msg: str) -> None:
+    print(_paint("red", f"  ✖ {msg}"))
+
+
+def _header(title: str) -> None:
+    print()
+    print(_paint("cyan", f"● {title}"))
+    print(_paint("dim", "─" * 48))
 
 
 def _prompt(prompt: str, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default else ""
-    return input(f"{prompt}{suffix}: ").strip() or (default or "")
+    suffix = _paint("dim", f" [{default}]") if default else ""
+    return input(f"{_paint('green', '❯')} {prompt}{suffix}: ").strip() or (default or "")
 
 
 def _prompt_yes_no(prompt: str, default: str = "n") -> bool:
-    suffix = " [Y/n]" if default == "y" else " [y/N]"
+    suffix = _paint("dim", " [Y/n]" if default == "y" else " [y/N]")
     while True:
         raw = _prompt(prompt + suffix, default).strip().lower()
         if raw in ("y", "yes"):
             return True
         if raw in ("n", "no", ""):
             return False
-        print("  Please answer y or n.")
+        _error("Please answer y or n.")
 
 
 # ----------------------------------------------------------------------
@@ -48,11 +83,13 @@ _MENU_LINES = 0
 
 
 def _draw_menu(prompt: str, options: list[str], idx: int) -> list[str]:
-    lines = [prompt]
+    lines = [_paint("bold", prompt)]
     for i, opt in enumerate(options):
-        marker = "●" if i == idx else " "
-        lines.append(f"  {marker} {i + 1}) {opt}")
-    lines.append("  ↑/↓ move · 1-9 jump · Enter confirm")
+        if i == idx:
+            lines.append(_paint("cyan", f"  ● {i + 1}) {opt}"))
+        else:
+            lines.append(_paint("dim", f"    {i + 1}) {opt}"))
+    lines.append(_paint("dim", "  ↑/↓ move · 1-9 jump · Enter confirm"))
     return lines
 
 
@@ -170,110 +207,122 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     cfg_dir = cfg.config_dir
     existing = set(cfg.list_destinations())
 
-    print("Create a new bu destination\n")
+    print(_paint("bold", "Create a new backup destination"))
+    print(_paint("dim", "Ctrl-C aborts at any time."))
+
+    step = 0
+
+    def _section(title: str) -> None:
+        nonlocal step
+        step += 1
+        _header(f"Step {step} · {title}")
 
     # ------------------------------------------------------------------
     # 1. Destination name (optional positional argument)
     # ------------------------------------------------------------------
+    _section("Destination name")
     if name:
         if not VALID_NAME_RE.match(name):
-            print(f"Invalid name {name!r} — use only letters, digits, '-' or '_'.")
+            _error(f"Invalid name {name!r} — use only letters, digits, '-' or '_'.")
             raise SystemExit(1)
         if name in existing:
-            print(f"Destination {name!r} already exists.")
+            _error(f"Destination {name!r} already exists.")
             raise SystemExit(1)
-        print(f"Destination name: {name}")
+        print(_paint("green", f"  ✓ {name}"))
     else:
         while True:
-            name = _prompt("Destination name")
+            name = _prompt("name")
             if not name:
-                print("  A name is required.")
+                _error("A name is required.")
                 continue
             if not VALID_NAME_RE.match(name):
-                print("  Use only letters, digits, '-' or '_' — no spaces.")
+                _error("Use only letters, digits, '-' or '_' — no spaces.")
                 continue
             if name in existing:
-                print(f"  Destination {name!r} already exists — pick another name.")
+                _error(f"Destination {name!r} already exists — pick another name.")
                 continue
             break
 
     # ------------------------------------------------------------------
     # 2. Backup type — drives the destination and method prompts
     # ------------------------------------------------------------------
-    backup_type = pick("Backup type:", ["DIR", "B2"], default_index=0)
+    _section("Backup Destination")
+    backup_type = pick("Where should backups go?", ["Directory", "Backblaze (B2)"], default_index=0)
+    is_b2 = backup_type != "Directory"
 
     # ------------------------------------------------------------------
     # 3. Destination — DIR asks for a local directory, B2 for bucket details
     # ------------------------------------------------------------------
-    if backup_type == "DIR":
+    _section("Destination")
+    if not is_b2:
         while True:
-            raw = input("  destination directory: ").strip()
+            raw = _prompt("destination directory")
             if not raw:
-                print("  A destination directory is required.")
+                _error("A destination directory is required.")
                 continue
             p = Path(raw).expanduser()
             if not p.exists():
-                if _prompt_yes_no(f"  {p} does not exist — create it?"):
+                if _prompt_yes_no(f"{p} does not exist — create it?"):
                     try:
                         p.mkdir(parents=True)
                     except OSError as e:
-                        print(f"  Cannot create {p}: {e}")
+                        _error(f"Cannot create {p}: {e}")
                         continue
                 else:
                     continue
             if not p.is_dir():
-                print(f"  Not a directory: {p}")
+                _error(f"Not a directory: {p}")
                 continue
             if not os.access(p, os.W_OK):
-                print(f"  Not writable: {p}")
+                _error(f"Not writable: {p}")
                 continue
             dest = str(Path(raw).expanduser())
             break
     else:  # B2
-        print(f"Backblaze B2 destination for {name!r}:")
         while True:
-            bucket = input("  bucket name: ").strip()
+            bucket = _prompt("bucket name")
             if not bucket:
-                print("  Bucket name is required.")
+                _error("Bucket name is required.")
                 continue
             if not re.match(r"^[A-Za-z0-9][A-Za-z0-9-]*$", bucket):
-                print("  Bucket names use letters, digits, and hyphens — no spaces or slashes.")
+                _error("Bucket names use letters, digits, and hyphens — no spaces or slashes.")
                 continue
             break
-        bpath = _prompt("  path within bucket (blank = bucket root)")
+        bpath = _prompt("path within bucket (blank = bucket root)")
         dest = f"b2://{bucket}/{bpath}" if bpath else f"b2://{bucket}"
+    print(_paint("green", f"  ✓ {dest}"))
 
     extra: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # 4. B2 credentials — always for B2 destinations
     # ------------------------------------------------------------------
-    if backup_type == "B2":
-        print(f"Backblaze B2 credentials for {name!r}:")
-        mode = pick("  store as:", ["plaintext", "encrypted"], default_index=0)
+    if is_b2:
+        _section("Backblaze B2 credentials")
+        mode = pick("How do you want to store the B2 credentials?", ["plaintext", "encrypted"], default_index=0)
         while True:
-            aid = _prompt("  account ID")
+            aid = _prompt("account ID")
             if aid:
                 break
-            print("  Account ID is required.")
+            _error("Account ID is required.")
         while True:
-            akey = getpass.getpass("  application key: ").strip()
+            akey = getpass.getpass(_paint("yellow", "  application key") + ": ").strip()
             if akey:
                 break
-            print("  Application key is required.")
+            _error("Application key is required.")
 
         if mode == "encrypted":
             while True:
-                pw = getpass.getpass("  encryption password: ")
-                pw2 = getpass.getpass("  repeat password: ")
+                pw = getpass.getpass(_paint("yellow", "  encryption password") + ": ")
+                pw2 = getpass.getpass(_paint("yellow", "  repeat password") + ": ")
                 if pw == pw2 and pw:
                     break
-                print("  Passwords don't match (or are empty) — try again.")
+                _error("Passwords don't match (or are empty) — try again.")
             try:
                 extra["b2_account_id_enc"] = encrypt_secret(aid, pw)
                 extra["b2_account_key_enc"] = encrypt_secret(akey, pw)
             except CryptoError as e:
-                print(f"  Encryption failed: {e}")
+                _error(f"Encryption failed: {e}")
                 raise SystemExit(1)
         else:
             extra["b2_account_id"] = aid
@@ -282,49 +331,56 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     # ------------------------------------------------------------------
     # 5. Method — DIR offers both, B2 is always duplicity
     # ------------------------------------------------------------------
-    if backup_type == "DIR":
-        method = pick("Method:", ["rsync", "duplicity"], default_index=0)
+    _section("Backup method")
+    if not is_b2:
+        method = pick("Backup method:", ["rsync", "duplicity"], default_index=0)
     else:
         method = "duplicity"
-        print("Method: duplicity (B2 backups always use duplicity)")
+        print(_paint("dim", "  duplicity — B2 backups are always encrypted with duplicity"))
 
     # ------------------------------------------------------------------
     # 6. Source paths
     # ------------------------------------------------------------------
-    print("Source paths (directories to back up):")
+    _section("Source paths")
+    print(_paint("dim", "  Directories to back up (one per archive):"))
     sources: list[str] = []
     while True:
-        label = "  path" if sources else "  path (required)"
+        label = _paint("green", "❯") + (" path" if sources else " path (required)")
         raw = input(f"{label}: ").strip()
         if not raw:
             if sources:
                 break
-            print("  At least one source path is required.")
+            _error("At least one source path is required.")
             continue
         p = Path(raw).expanduser()
         if not p.exists():
-            print(f"  Not found: {raw}")
+            _error(f"Not found: {raw}")
             continue
         if not p.is_dir():
-            print(f"  Not a directory: {raw}")
+            _error(f"Not a directory: {raw}")
             continue
         sources.append(str(Path(raw).expanduser()))
-        if not _prompt_yes_no("  add another source?"):
+        if not _prompt_yes_no("add another source?"):
             break
 
     # ------------------------------------------------------------------
     # 7. GPG passphrase — duplicity only
     # ------------------------------------------------------------------
     if method == "duplicity":
-        choice = pick("  GPG passphrase handling:", ["prompt", "file"], default_index=0)
+        _section("GPG passphrase")
+        choice = pick(
+            "How do you want to handle the duplicity GPG passphrase?",
+            ["prompt", "file"],
+            default_index=0,
+        )
         if choice == "file":
             default_pf = str(Path.home() / ".config" / "bu" / "secrets" / f"{name}.pass")
-            pf = _prompt("  passphrase file", default_pf)
+            pf = _prompt("passphrase file", default_pf)
             while True:
-                pp = getpass.getpass("  passphrase: ").strip()
+                pp = getpass.getpass(_paint("yellow", "  passphrase") + ": ").strip()
                 if pp:
                     break
-                print("  Passphrase is required.")
+                _error("Passphrase is required.")
             _write_passphrase_file(Path(pf).expanduser(), pp)
             extra["passphrase_file"] = str(Path(pf).expanduser())
 
@@ -332,13 +388,15 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     # 8. Optional duplicity settings
     # ------------------------------------------------------------------
     if method == "duplicity":
-        if raw := _prompt("  full_if_older_than (e.g. 30D, blank = default)"):
+        _section("duplicity options")
+        if raw := _prompt("change default duplicity 'full if older than' setting (e.g. 30D, blank = default)"):
             extra["full_if_older_than"] = raw
-        if raw := _prompt("  verbosity (0-9, blank = auto)"):
-            if raw.isdigit() and 0 <= int(raw) <= 9:
-                extra["verbosity"] = raw
-            else:
-                print("  Ignored invalid verbosity (must be 0-9).")
+        verbosity = pick(
+            "How verbose should duplicity be?",
+            ["Verbose (9)", "Quiet (0)"],
+            default_index=0,
+        )
+        extra["verbosity"] = "0" if verbosity == "Quiet (0)" else "9"
 
     # ------------------------------------------------------------------
     # 9. Assemble and write the config
