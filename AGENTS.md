@@ -7,32 +7,33 @@ CLI) that backs up source directories via **rsync** (local) or **duplicity**
 ## Command format rules
 
 ```
-bu <ACTION> <DESTINATION> [OPTIONS...]
+bu ACTION NAME [ARGS...]
 ```
 
-- `<ACTION>` is one of: `backup`, `restore`, `status`, `list`, `config`,
-  `delete`, `history`, `log`, `encrypt`, `create`.
-- `<DESTINATION>` is a named destination that exists as a `.toml` config file
+- `ACTION` is one of: `backup`, `restore`, `status`, `list`, `config`,
+  `delete`, `history`, `log`, `encrypt`, `create`, `help`.
+- `NAME` is a named destination that exists as a `.toml` config file
   (except `list`, `encrypt`, `create`, and bare `config`, which take no
-  destination).
-- Common options: `--dry-run` (`-n`), `--json`, `--config <DIR>` (`-c`).
-  `backup`/`restore` also accept `--window/-w <N>` (live output window height).
+  name).
+- No command-line options — commands take positional arguments only. Use
+  `bu help` or `bu help ACTION` for usage (there is no `--help`). The
+  live-output window height is automatic (18 lines on a TTY, off when piped).
 - Commands are defined in `src/bu/cli.py` and listed in definition order via
   `OrderedGroup`. Keep the module docstring's action list in sync.
 - Every command exits non-zero (`sys.exit(1)`) on any error; friendly messages
   go to stderr via `click.echo(..., err=True)`.
-- `bu restore <DEST> <RESTORE_DIR> [PATH]` — `PATH` is a path within the backup;
+- `bu restore NAME RESTORE_DIR [PATH]` — `PATH` is a path within the backup;
   its files are restored into `RESTORE_DIR/<final path component>`
   (e.g. path `x/y` → `RESTORE_DIR/y`). Restore NEVER deletes files.
-- `bu delete <DEST> [--yes]` removes ONLY the config file. It must always warn
-  that backup contents are not deleted.
+- `bu delete NAME` removes ONLY the config file (always prompts for
+  confirmation). It must always warn that backup contents are not deleted.
 
 ### Destination names
 
 - Names may contain only `A-Za-z0-9_-` — enforced by `VALID_NAME_RE` in
   `src/bu/config.py` (the single source of truth; `wizard.py` and `actions.py`
   import it, don't redefine it).
-- A config file is `<name>.toml`; the filename stem is the destination name.
+- A config file is `name.toml`; the filename stem is the destination name.
 
 ## Configuration model
 
@@ -43,8 +44,8 @@ bu <ACTION> <DESTINATION> [OPTIONS...]
 - Optional keys: `history_file`, `log_file`, plus method-specific extras.
 - `_RESERVED_KEYS` in `src/bu/config.py` lists keys handled by the config layer;
   anything else flows through to the backend as `extra` config.
-- Generated configs (wizard, `bu config --method` templates) must use multiline
-  TOML lists:
+- Generated configs (wizard and the `bu config NAME` sample template) must
+  use multiline TOML lists:
 
   ```toml
   source_paths = [
@@ -53,7 +54,7 @@ bu <ACTION> <DESTINATION> [OPTIONS...]
   ]
   ```
 
-- `bu config <name>` validates the TOML after `$EDITOR` closes:
+- `bu config NAME` validates the TOML after `$EDITOR` closes:
   rsync + URL-ish destination → error ("rsync is local-only");
   duplicity with `b2:/...` (missing `//`) → error.
 
@@ -127,8 +128,7 @@ bu <ACTION> <DESTINATION> [OPTIONS...]
 - Tests must export temp dirs: `BU_CONFIG_DIR`, `BU_LOG_DIR`, `XDG_STATE_HOME`
   (plain shell assignment without `export` is NOT visible to child processes).
 - TTY-only features (live window, wizard menus, progress bars) must be tested
-  through a PTY (the terminal here is piped by default; `--json` output can be
-  checked without a PTY).
+  through a PTY (the terminal here is piped by default).
 - Lint with ruff (line-length 100).
 - Keep sample templates, wizard output, and README in sync when changing config
   keys, layout, or command behavior.
