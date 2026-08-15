@@ -41,7 +41,16 @@ bu ACTION NAME [ARGS...]
   `BU_CONFIG_DIR`). Example: `~/.config/bu/photos.toml`.
 - Required keys: `method` (`"rsync"` or `"duplicity"`), `source_paths`
   (list of directories), `destination` (path or URL).
-- Optional keys: `history_file`, `log_file`, plus method-specific extras.
+- Optional keys: `history_file`, `log_file`, `exclude_files`, plus
+  method-specific extras.
+- `exclude_files` (list) defaults to `<config_dir>/exclude.txt` (global) and
+  `<config_dir>/exclude-<name>.txt` (per destination); the key replaces the
+  defaults. Missing files are skipped by the backends. Shared rsync/duplicity
+  format: `#` comments, blank lines, one glob per line (`*`, `**`, `?`,
+  `[...]`), `+ ` include / `- ` exclude modifiers, patterns relative to each
+  source root. rsync gets the file as-is; duplicity gets each pattern as a
+  translated `**/`-prefixed `--include`/`--exclude` arg (duplicity 3.x rejects
+  bare globs with FilePrefixError).
 - `_RESERVED_KEYS` in `src/bu/config.py` lists keys handled by the config layer;
   anything else flows through to the backend as `extra` config.
 - Generated configs (wizard and the `bu config NAME` sample template) must
@@ -65,7 +74,8 @@ bu ACTION NAME [ARGS...]
 - Local directories only. `destination = "/mnt/backup"`.
 - Each source is mirrored **directly into the destination** as
   `<destination>/<source basename>/` — there is NO destination-name subfolder.
-- Backup uses `rsync -a --delete` (exact mirror) plus `--stats`; restore never
+- Backup uses `rsync -a --delete` (exact mirror) plus `--stats`, and
+  `--exclude-from=<file>` for each exclusion file that exists; restore never
   uses `--delete` and excludes the status file.
 - Status file: `<destination>/bu-<NAME>-status.txt` (JSON content), written at
   backup start/end (`started`/`completed`/`error`). Dry-runs write nothing.
@@ -78,6 +88,9 @@ bu ACTION NAME [ARGS...]
 - duplicity 3.x takes exactly ONE source per invocation → loop once per source,
   each into its own archive subdir `<destination>/<source basename>/`
   (same layout rule as rsync; B2 URLs get `/subdir` appended).
+- Exclusion files are passed to duplicity as translated per-pattern
+  `--include=<glob>` / `--exclude=<glob>` args (`translate_exclude_line` in
+  `duplicity.py`); only existing files are read.
 - Passphrase resolution order (never store it in the config):
   1. `passphrase_file` key — first line of the file (perms should be 0600)
   2. `BU_PASSPHRASE` / `PASSPHRASE` environment variable
@@ -116,6 +129,10 @@ bu ACTION NAME [ARGS...]
 - `src/bu/actions.py` — action handlers, formatters, sample config templates.
 - `src/bu/config.py` — config loading, `DestinationConfig`, validation.
 - `src/bu/wizard.py` — interactive `bu create` (arrow-key menus via termios).
+  The wizard always writes `exclude_files = [global, per-name]`; when neither
+  file exists it creates both — `exclude.txt` pre-filled with common
+  developer/editor patterns, `exclude-<name>.txt` empty — and tells the user
+  to review them.
 - `src/bu/backends/base.py` — `Backend` ABC, `LiveWindow` (docker-style
   redraw, title + yellow divider + throttled status line), `run_streaming`.
 - `src/bu/backends/{local,duplicity}.py` — `RsyncMethod`, `DuplicityMethod`.

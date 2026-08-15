@@ -2,7 +2,8 @@
 
 Flow: backup type (DIR or B2) → destination (local directory for DIR, or
 B2 bucket/path plus credentials for B2) → method (rsync/duplicity for DIR,
-duplicity-only for B2) → source paths → duplicity-specific options.
+duplicity-only for B2) → source paths → duplicity-specific options →
+exclusion files (global + per-name).
 Every answer is validated and re-prompted until it is correct.
 
 Choice menus are numbered and arrow-key scrollable when running on a TTY;
@@ -51,6 +52,10 @@ def _paint(color: str, text: str) -> str:
 
 def _error(msg: str) -> None:
     print(_paint("red", f"  ✖ {msg}"))
+
+
+def _note(msg: str) -> None:
+    print(_paint("yellow", f"  • {msg}"))
 
 
 def _header(title: str) -> None:
@@ -196,6 +201,49 @@ def _write_passphrase_file(path: Path, passphrase: str) -> None:
     os.chmod(path, 0o600)
 
 
+_GLOBAL_EXCLUDE_TEMPLATE = """\
+# Global exclusions — applied to every destination.
+# Shared rsync/duplicity format: '#' comments and blank lines are ignored,
+# one glob per line, relative to each source root.
+#   '*'    within a path component
+#   '**'   across directories
+#   '?'    single character, '[...]' character ranges
+#   '+ '   include an exception; a plain line (or '- ') excludes
+#
+# Common developer files
+.git
+.svn
+.hg
+CVS
+__pycache__
+*.pyc
+*.pyo
+node_modules
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+build
+dist
+target
+*.o
+*.obj
+*.class
+#
+# Common editor / OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea
+.vscode
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+"""
+
+
 def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -> dict[str, Any]:
     """Run the interactive wizard and write the resulting .toml config.
 
@@ -292,7 +340,7 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
         dest = f"b2://{bucket}/{bpath}" if bpath else f"b2://{bucket}"
     print(_paint("green", f"  ✓ {dest}"))
 
-    extra: dict[str, str] = {}
+    extra: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # 4. B2 credentials — always for B2 destinations
@@ -399,7 +447,31 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
         extra["verbosity"] = "0" if verbosity == "Quiet (0)" else "9"
 
     # ------------------------------------------------------------------
-    # 9. Assemble and write the config
+    # 9. Exclusion files — global + per-name, created on demand
+    # ------------------------------------------------------------------
+    _section("Exclusion files")
+    global_excl = cfg_dir / "exclude.txt"
+    name_excl = cfg_dir / f"exclude-{name}.txt"
+
+    if not global_excl.exists() and not name_excl.exists():
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        global_excl.write_text(_GLOBAL_EXCLUDE_TEMPLATE)
+        name_excl.write_text(
+            f"# Exclusions for {name!r} — add one glob per line.\n"
+            "# Shared rsync/duplicity format; see exclude.txt for the global list.\n"
+        )
+        print(_paint("green", f"  ✓ Created {global_excl.name} with common defaults"))
+        print(_paint("green", f"  ✓ Created {name_excl.name} (empty)"))
+    else:
+        print(_paint("dim", f"  Using {global_excl.name} and {name_excl.name} (already exist)"))
+        if not global_excl.exists() or not name_excl.exists():
+            _note("One of the two files does not exist yet — it is ignored until created.")
+
+    extra["exclude_files"] = [str(global_excl), str(name_excl)]
+    print(_paint("yellow", "  • Check and edit both exclusion files to match your needs"))
+
+    # ------------------------------------------------------------------
+    # 10. Assemble and write the config
     # ------------------------------------------------------------------
     history_path = str(_default_history_dir() / f"{name}.json")
     log_path = str(_default_raw_log_dir() / f"{name}.log")

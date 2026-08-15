@@ -129,6 +129,9 @@ class RsyncMethod(Backend):
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
+        # Exclusion files that actually exist (missing ones are ignored).
+        exclude_from = self._existing_exclude_files()
+
         # One live window shared across all source runs
         window = LiveWindow(
             scroll_lines,
@@ -138,7 +141,9 @@ class RsyncMethod(Backend):
         try:
             for src_str in source_paths:
                 src = Path(src_str).expanduser().resolve()
-                result = self._rsync_one(src, dest / src.name, dry_run, window=window)
+                result = self._rsync_one(
+                    src, dest / src.name, dry_run, window=window, exclude_from=exclude_from,
+                )
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
@@ -244,6 +249,13 @@ class RsyncMethod(Backend):
         except (FileNotFoundError, OSError):
             return ""
 
+    def _existing_exclude_files(self) -> list[str]:
+        """Return exclusion-file paths that exist on disk (for --exclude-from)."""
+        return [
+            p for p in self.config.get("_exclude_files", [])
+            if isinstance(p, str) and Path(p).is_file()
+        ]
+
     def _rsync_one(
         self,
         src: Path,
@@ -254,12 +266,14 @@ class RsyncMethod(Backend):
         window: "LiveWindow | None" = None,
         title: str = "Live output",
         exclude: str | None = None,
+        exclude_from: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
         ``delete=False`` keeps the restore non-destructive; ``exclude``
         skips a file/directory name (used to keep the bu status file out
-        of restores).
+        of restores); ``exclude_from`` lists exclusion files to pass via
+        ``--exclude-from``.
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
@@ -276,6 +290,8 @@ class RsyncMethod(Backend):
             cmd.append("--delete")
         if exclude:
             cmd.append(f"--exclude={exclude}")
+        for ef in exclude_from or []:
+            cmd.append(f"--exclude-from={ef}")
         if dry_run:
             cmd.append("--dry-run")
         cmd.append(f"{src}/")

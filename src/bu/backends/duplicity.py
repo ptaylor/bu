@@ -34,6 +34,33 @@ from bu.backends.base import Backend, LiveWindow, run_streaming
 from bu.crypto import CryptoError, decrypt_secret
 
 
+def translate_exclude_line(line: str) -> tuple[bool, str] | None:
+    """Convert one rsync-style exclusion line into a duplicity (include, glob).
+
+    Returns None for blank/comment lines.  duplicity 3.x rejects globs that
+    cannot match the backup base directory (bare names, rooted paths), so
+    plain patterns get a ``**/`` prefix after stripping any leading ``/``;
+    ``**`` patterns pass through unchanged.  ``+ `` / ``- `` modifiers map
+    to duplicity include/exclude.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    include = False
+    if line.startswith("+ "):
+        include, pattern = True, line[2:].strip()
+    elif line.startswith("- "):
+        include, pattern = False, line[2:].strip()
+    else:
+        pattern = line
+    if not pattern:
+        return None
+    pattern = pattern.lstrip("/")
+    if not pattern.startswith("**"):
+        pattern = "**/" + pattern
+    return include, pattern
+
+
 def condense_stderr(stderr: str) -> list[str]:
     """Condense duplicity's multi-line stderr into single-line error messages.
 
@@ -69,7 +96,7 @@ def condense_stderr(stderr: str) -> list[str]:
                 "GPG decryption failed: Bad session key — is the passphrase correct?"
             )
         elif "GPG Failed" in text:
-            summaries.append("GPG decryption failed — is the passphrase correct?")
+            summaries.append("GPG failed — check the passphrase and that gpg-agent is working.")
         elif first.startswith("Traceback"):
             summaries.append("duplicity failed with an internal error (see the log for details).")
         elif first.startswith("Error processing remote file ("):
@@ -292,6 +319,30 @@ class DuplicityMethod(Backend):
             ]
         return {"BACKEND_PASSWORD": creds[1]}, []
 
+    def _exclude_args(self) -> list[str]:
+        """Build duplicity include/exclude args from rsync-style exclusion files.
+
+        Each line is translated to a ``**/``-prefixed glob (duplicity 3.x
+        raises FilePrefixError on bare patterns) and passed as
+        ``--include=<glob>`` or ``--exclude=<glob>``.  Missing files are
+        skipped.
+        """
+        args: list[str] = []
+        for path in self.config.get("_exclude_files", []):
+            if not isinstance(path, str):
+                continue
+            p = Path(path)
+            if not p.is_file():
+                continue
+            for line in p.read_text().splitlines():
+                translated = translate_exclude_line(line)
+                if translated is None:
+                    continue
+                include, pattern = translated
+                flag = "--include" if include else "--exclude"
+                args.append(f"{flag}={pattern}")
+        return args
+
     def _run_duplicity(
         self,
         args: list[str],
@@ -424,6 +475,9 @@ class DuplicityMethod(Backend):
         if b2_errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": b2_errors}
 
+        # Exclusions translated from rsync-style files (missing files ignored).
+        exclude_args = self._exclude_args()
+
         if not dry_run:
             self._write_status("started")
 
@@ -462,6 +516,7 @@ class DuplicityMethod(Backend):
                     args.append("--progress")
                 if dry_run:
                     args.append("--dry-run")
+                args.extend(exclude_args)
                 args.append(str(src))
                 args.append(self._target_url(candidate))
 

@@ -45,7 +45,7 @@ class ConfigError(Exception):
 
 
 # Keys that are handled specially and NOT passed through to backend ``extra``.
-_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file"})
+_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file", "exclude_files"})
 
 # Valid method names.
 _VALID_METHODS = frozenset({"rsync", "duplicity"})
@@ -81,13 +81,15 @@ def _default_raw_log_dir() -> Path:
 class DestinationConfig:
     """Holds the parsed configuration for a single backup destination."""
 
-    def __init__(self, name: str, data: dict[str, Any]) -> None:
+    def __init__(self, name: str, data: dict[str, Any], config_dir: Path | None = None) -> None:
         self.name = name
         self.method: str = data.get("method", "")
         self.source_paths: list[str] = data.get("source_paths", [])
         self.destination: str = data.get("destination", "")
+        self._config_dir = config_dir
         self._history_file_override: str | None = data.get("history_file")
         self._log_file_override: str | None = data.get("log_file")
+        self._exclude_files_override: list[str] | None = data.get("exclude_files")
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
             if k not in _RESERVED_KEYS
@@ -112,6 +114,23 @@ class DestinationConfig:
         if self._log_file_override:
             return Path(self._log_file_override).expanduser()
         return _default_raw_log_dir() / f"{self.name}.log"
+
+    @property
+    def exclude_files(self) -> list[Path]:
+        """Exclusion files for backups.
+
+        Defaults to a global ``exclude.txt`` plus a per-destination
+        ``exclude-<name>.txt`` in the config directory; the optional
+        ``exclude_files`` config key replaces the defaults entirely.
+        Missing files are ignored by the backends.
+        """
+        if self._exclude_files_override is not None:
+            return [Path(p).expanduser() for p in self._exclude_files_override]
+        cfg_dir = self._config_dir or Config._default_dir()
+        return [
+            cfg_dir / "exclude.txt",
+            cfg_dir / f"exclude-{self.name}.txt",
+        ]
 
     def __repr__(self) -> str:
         return f"DestinationConfig(name={self.name!r}, method={self.method!r})"
@@ -187,7 +206,7 @@ class Config:
                 errors.append(f"{fp.name}: missing required 'destination' path")
                 continue
 
-            self.destinations[name] = DestinationConfig(name, data)
+            self.destinations[name] = DestinationConfig(name, data, config_dir=self.config_dir)
 
         if errors:
             raise ConfigError("\n".join(errors))

@@ -327,8 +327,9 @@ def create(name: str | None) -> None:
     given), backup type (DIR or B2), destination (local directory, or
     B2 bucket/path and credentials), method (rsync/duplicity for DIR,
     duplicity-only for B2), source paths, and method-specific options
-    (GPG passphrase).  Invalid answers are rejected and re-prompted;
-    choices use numbered, arrow-key menus.
+    (GPG passphrase).  It also sets up global and per-name exclusion
+    files.  Invalid answers are rejected and re-prompted; choices use
+    numbered, arrow-key menus.
     """
     from bu.wizard import run_create_wizard
 

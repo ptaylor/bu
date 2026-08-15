@@ -74,6 +74,7 @@ verbosity = 9                                        # 0 = quiet, 9 = verbose
 | `destination` | Yes | Base target directory, or a `b2://bucket/path` URL (duplicity only) |
 | `history_file` | No | Path to structured JSON-lines action history |
 | `log_file` | No | Path to raw execution log |
+| `exclude_files` | No | List of exclusion files; defaults to `exclude.txt` (global) + `exclude-NAME.txt` (per destination) |
 | `passphrase_file` | No | duplicity: file whose first line holds the GPG passphrase (perms 0600) |
 | `full_if_older_than` | No | duplicity: force a full backup when the last one is older than this (e.g. `"30D"`) |
 | `verbosity` | No | duplicity: output verbosity 0-9 (default: automatic) |
@@ -84,6 +85,32 @@ For `rsync`, each source is mirrored directly into `destination/<source name>`.
 For `duplicity`, each source gets its own encrypted archive under the same
 layout.
 
+### Exclusions
+
+Files can be skipped during backup with exclusion files. Without an
+`exclude_files` key, `bu` uses two default files (missing files are ignored):
+
+- `~/.config/bu/exclude.txt` — global exclusions for every destination
+- `~/.config/bu/exclude-NAME.txt` — exclusions for the `NAME` destination
+
+Setting `exclude_files` replaces the defaults with your own list. The same
+file format works for rsync and duplicity:
+
+```
+# comments and blank lines are ignored
+*.tmp
+**/node_modules
+Cache
+.DS_Store
++ .keep     # '+ ' includes an exception; plain lines exclude
+```
+
+One pattern per line, relative to each source root: `*` matches within a
+path component, `**` matches any depth, `?` and `[...]` work as usual.
+A pattern matching a directory also excludes its contents. The same file
+works for both methods: bu passes it to rsync as-is and translates each
+pattern for duplicity (which requires `**/`-prefixed globs).
+
 ### Creating a config
 
 ```bash
@@ -92,6 +119,8 @@ bu create photos
 
 The interactive wizard asks for the backup type (Directory or Backblaze B2),
 destination, credentials, method, and source paths, then writes the config.
+It also sets `exclude_files` to the global and per-name exclusion files,
+creating both (with sensible defaults) if neither exists yet.
 Alternatively, `bu config photos` opens `$EDITOR` (default `vi`) with a
 pre-filled template; after saving, the TOML is validated.
 

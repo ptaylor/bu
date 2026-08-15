@@ -34,6 +34,10 @@ source_paths = [
     "~/notes",
 ]
 destination = "/mnt/backup/docs"
+# exclude_files = [
+#     "~/.config/bu/exclude.txt",
+#     "~/.config/bu/exclude-docs.txt",
+# ]   # omitted: defaults to those two files (missing files are ignored)
 {history_file}
 {log_file}
 """
@@ -54,6 +58,10 @@ destination = "/mnt/backup/docs"            # or "b2://bucket-name/path"
 #   Plaintext:  b2_account_id = "..."   b2_account_key = "..."
 #   Encrypted:  b2_account_id_enc = "<gpg armored>"  b2_account_key_enc = "<gpg armored>"
 #               (use 'bu encrypt' to create armored blobs; password is prompted on use)
+# exclude_files = [
+#     "~/.config/bu/exclude.txt",
+#     "~/.config/bu/exclude-docs.txt",
+# ]   # omitted: defaults to those two files (missing files are ignored)
 {history_file}
 {log_file}
 """
@@ -65,6 +73,10 @@ _SAMPLE_GENERIC = """\
 #     "/path/to/backup",
 # ]
 # destination = "/path/to/backup/location"
+# exclude_files = [
+#     "~/.config/bu/exclude.txt",
+#     "~/.config/bu/exclude-name.txt",
+# ]   # omitted: defaults to those two files (missing files are ignored)
 {history_file}
 {log_file}
 """
@@ -78,6 +90,7 @@ def _build_backend(dest: DestinationConfig) -> Any:
     config["destination"] = dest.destination
     config["_name"] = dest.name
     config["_source_paths"] = list(dest.source_paths)
+    config["_exclude_files"] = [str(p) for p in dest.exclude_files]
     return backend_cls(config)
 
 
