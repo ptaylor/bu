@@ -331,7 +331,7 @@ class RsyncMethod(Backend):
         source_paths = self.config.get("_source_paths", [])
 
         result: dict[str, Any] = {
-            "destination": name,
+            "name": name,
             "method": "rsync",
             "config_ok": True,
             "source_paths": source_paths,

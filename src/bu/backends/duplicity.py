@@ -605,7 +605,7 @@ class DuplicityMethod(Backend):
         if is_b2:
             base = Path("")
             result: dict[str, Any] = {
-                "destination": name,
+                "name": name,
                 "method": "duplicity",
                 "config_ok": True,
                 "source_paths": source_paths,
@@ -615,7 +615,7 @@ class DuplicityMethod(Backend):
         else:
             base = Path(self.config.get("destination", "")).expanduser()
             result = {
-                "destination": name,
+                "name": name,
                 "method": "duplicity",
                 "config_ok": True,
                 "source_paths": source_paths,

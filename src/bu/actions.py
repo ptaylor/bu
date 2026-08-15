@@ -90,7 +90,7 @@ def _write_action_header(
     """Print a details block before running an action."""
     out = sys.stdout
     out.write(f"Action       : {action}\n")
-    out.write(f"Destination  : {dest.name}\n")
+    out.write(f"Name         : {dest.name}\n")
     out.write(f"Method       : {dest.method}\n")
     if restore_to:
         out.write(f"Restore to   : {restore_to}\n")
@@ -354,7 +354,7 @@ def _default_config_dir() -> Path:
     return Path(xdg) / "bu"
 
 
-def _sample_for_method(method: str, destination: str) -> str:
+def _sample_for_method(method: str, name: str) -> str:
     """Return a sample config template for the given method type.
 
     Both ``history_file`` and ``log_file`` are pre-filled with their
@@ -362,10 +362,10 @@ def _sample_for_method(method: str, destination: str) -> str:
     """
     from bu.config import _default_history_dir, _default_raw_log_dir
 
-    history_path = _default_history_dir() / f"{destination}.json"
+    history_path = _default_history_dir() / f"{name}.json"
     history_line = f'history_file = "{history_path}"'
 
-    log_path = _default_raw_log_dir() / f"{destination}.log"
+    log_path = _default_raw_log_dir() / f"{name}.log"
     log_line = f'log_file = "{log_path}"'
 
     samples: dict[str, str] = {
@@ -379,7 +379,7 @@ def _sample_for_method(method: str, destination: str) -> str:
 def action_config(
     config_dir: Path | None = None,
     *,
-    destination: str | None = None,
+    name: str | None = None,
     method: str | None = None,
 ) -> dict[str, Any]:
     """Open a destination config file in $EDITOR (default vi) for editing.
@@ -392,7 +392,7 @@ def action_config(
     ----------
     config_dir : Path or None
         Explicit config directory. If None, uses the default path.
-    destination : str or None
+    name : str or None
         The destination name to edit. Required for editing a specific destination.
         If None, lists all configured destinations.
     method : str or None
@@ -400,8 +400,8 @@ def action_config(
     """
     cfg_dir = config_dir or _default_config_dir()
 
-    # If no destination specified, list what's available
-    if not destination:
+    # If no name specified, list what's available
+    if not name:
         cfg_dir.mkdir(parents=True, exist_ok=True)
         cfg = Config(cfg_dir)
         dests = cfg.list_destinations()
@@ -410,8 +410,8 @@ def action_config(
                 "ok": True,
                 "config_dir": str(cfg_dir),
                 "destinations": dests,
-                "hint": f"Run 'bu config <name>' to edit a destination, "
-                        f"or 'bu config <name> --method rsync|duplicity' to create one.",
+                "hint": "Run 'bu config NAME' to edit a destination, "
+                        "or 'bu create' for a guided setup.",
             }
         else:
             return {
@@ -419,28 +419,28 @@ def action_config(
                 "config_dir": str(cfg_dir),
                 "destinations": [],
                 "hint": "No destinations yet. "
-                        "Run 'bu config <name> --method rsync|duplicity' to create one.",
+                        "Run 'bu create' for a guided setup, or 'bu config NAME'.",
             }
 
     # Validate the destination name before touching the filesystem
-    if not VALID_NAME_RE.match(destination):
+    if not VALID_NAME_RE.match(name):
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "errors": [
-                f"Invalid destination name {destination!r} — names may only "
+                f"Invalid name {name!r} — names may only "
                 "contain letters, digits, '-' and '_'."
             ],
         }
 
     # Determine the file path for this destination
-    file_path = cfg_dir / f"{destination}.toml"
+    file_path = cfg_dir / f"{name}.toml"
 
     # Create the file with sample content if it doesn't exist
     created = False
     if not file_path.exists():
         cfg_dir.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(_sample_for_method(method or "", destination))
+        file_path.write_text(_sample_for_method(method or "", name))
         created = True
 
     # Determine the editor
@@ -452,7 +452,7 @@ def action_config(
     except FileNotFoundError:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [f"Editor '{editor}' not found. Set $EDITOR or install vi."],
@@ -465,7 +465,7 @@ def action_config(
     except tomllib.TOMLDecodeError as e:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [f"Invalid TOML: {e}"],
@@ -473,7 +473,7 @@ def action_config(
     except OSError as e:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [f"Cannot read config: {e}"],
@@ -483,7 +483,7 @@ def action_config(
     if not isinstance(raw, dict):
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": ["Config must contain key-value pairs (not an array)."],
@@ -493,7 +493,7 @@ def action_config(
     if not raw_method:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": ["Missing required 'method' key. Must be one of: rsync, duplicity."],
@@ -502,7 +502,7 @@ def action_config(
     if raw_method not in ("rsync", "duplicity"):
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [f"Unknown method {raw_method!r}. Must be one of: rsync, duplicity."],
@@ -512,7 +512,7 @@ def action_config(
     if not source_paths:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": ["Missing required 'source_paths' key."],
@@ -522,7 +522,7 @@ def action_config(
     if not raw_dest:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": ["Missing required 'destination' key (backup target path)."],
@@ -535,7 +535,7 @@ def action_config(
     if raw_method == "rsync" and scheme_match:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [
@@ -548,7 +548,7 @@ def action_config(
     if raw_method == "duplicity" and scheme_match and not url_match:
         return {
             "ok": False,
-            "destination": destination,
+            "name": name,
             "created": created,
             "file": str(file_path),
             "errors": [
@@ -559,12 +559,12 @@ def action_config(
 
     # Build a DestinationConfig directly from the parsed data so we
     # validate *only* this file — not every .toml in the directory.
-    dest_cfg = DestinationConfig(destination, raw)
+    dest_cfg = DestinationConfig(name, raw)
 
     return {
         "ok": True,
         "destination": {
-            "name": destination,
+            "name": name,
             "method": dest_cfg.method,
             "path": dest_cfg.destination,
             "source_paths": dest_cfg.source_paths,
@@ -748,7 +748,7 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
         return json.dumps(result, indent=2, default=str)
 
     lines: list[str] = []
-    lines.append(f"Destination  : {result.get('destination', '?')}")
+    lines.append(f"Name         : {result.get('name', '?')}")
     lines.append(f"Method       : {result.get('method', '?')}")
 
     sources = result.get("sources", [])
