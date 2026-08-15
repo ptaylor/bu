@@ -1,7 +1,8 @@
 """duplicity method — encrypted incremental backups via the duplicity CLI.
 
-Backs up to a local ``file://`` target: ``<destination>/<source name>``
-(one archive subdirectory per source, like the rsync method).
+Backs up to a local ``file://`` target or a Backblaze B2 ``b2://`` target:
+``<destination>/<source name>`` (one archive subdirectory per source, like the
+rsync method).
 
 Passphrase resolution order (backup and restore):
     1. ``passphrase_file`` key in the .toml — file containing the passphrase
@@ -27,6 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
 from bu.crypto import CryptoError, decrypt_secret
@@ -99,18 +101,30 @@ class DuplicityMethod(Backend):
     # helpers
     # ------------------------------------------------------------------
 
-    def _target_url(self, subdir: str | None = None) -> str:
+    def _target_url(self, subdir: str | None = None, account_id: str | None = None) -> str:
         """Return the duplicity target URL.
 
         If ``destination`` is a full URL (e.g. ``b2://bucket/path``) it is
         used as-is; otherwise it is treated as a local path:
         ``file://<destination>[/<subdir>]``.
+
+        duplicity 3.x reads the B2 account ID from the URL username
+        (``b2://<account_id>@bucket/path``); when ``account_id`` is omitted
+        it is taken from the resolved-credentials cache.
         """
         destination = self.config.get("destination", "")
         if not destination:
             raise ValueError("duplicity method requires 'destination' in config")
         if "://" in destination:
             url = destination.rstrip("/")
+            if self._is_b2():
+                aid = account_id
+                if aid is None:
+                    creds = getattr(self, "_b2_creds_cache", None)
+                    aid = creds[0] if creds else None
+                if aid:
+                    scheme, _, rest = url.partition("://")
+                    url = f"{scheme}://{quote(aid, safe='')}@{rest}"
             return f"{url}/{subdir}" if subdir else url
         base = Path(destination).expanduser().resolve()
         return f"file://{base / subdir}" if subdir else f"file://{base}"
@@ -211,13 +225,21 @@ class DuplicityMethod(Backend):
             2. Encrypted ``b2_account_id_enc`` + ``b2_account_key_enc`` keys
                (prompts for the password via getpass)
             3. ``B2_ACCOUNT_ID`` / ``B2_APPLICATION_KEY`` environment vars
+
+        Successful resolutions are cached so the encrypted-credentials
+        password is only prompted for once per run.
         """
+        cached = getattr(self, "_b2_creds_cache", None)
+        if cached:
+            return cached
+
         name = self.config.get("_name", "unknown")
 
         # 1. Plaintext in config
         aid = self.config.get("b2_account_id", "")
         akey = self.config.get("b2_account_key", "")
         if aid and akey:
+            self._b2_creds_cache = (aid, akey)
             return aid, akey
 
         # 2. Encrypted in config — prompt for password
@@ -235,18 +257,25 @@ class DuplicityMethod(Backend):
                 akey = decrypt_secret(akey_enc, pw) if akey_enc else ""
             except CryptoError as e:
                 raise ValueError(f"Failed to decrypt B2 credentials: {e}") from e
+            self._b2_creds_cache = (aid, akey)
             return aid, akey
 
         # 3. Environment fallback
         env_aid = os.environ.get("B2_ACCOUNT_ID", "")
         env_akey = os.environ.get("B2_APPLICATION_KEY", "")
         if env_aid and env_akey:
+            self._b2_creds_cache = (env_aid, env_akey)
             return env_aid, env_akey
 
         return None
 
     def _b2_env(self) -> tuple[dict[str, str], list[str]]:
-        """Return (env, errors) with B2 credentials if the target is B2."""
+        """Return (env, errors) with B2 credentials if the target is B2.
+
+        duplicity 3.x ignores ``B2_ACCOUNT_ID``/``B2_APPLICATION_KEY``:
+        the account ID goes into the target URL (see ``_target_url``) and
+        the application key is passed as the ``BACKEND_PASSWORD`` env var.
+        """
         if not self._is_b2():
             return {}, []
         try:
@@ -255,18 +284,20 @@ class DuplicityMethod(Backend):
             return {}, [str(e)]
         if not creds:
             return {}, [
-                "Backblaze B2 destination requires credentials: set "
-                "b2_account_id/b2_account_key (or the _enc variants) in "
-                "the config, or B2_ACCOUNT_ID/B2_APPLICATION_KEY env vars."
+                (
+                    "Backblaze B2 destination requires credentials: set "
+                    "b2_account_id/b2_account_key (or the _enc variants) in "
+                    "the config, or B2_ACCOUNT_ID/B2_APPLICATION_KEY env vars."
+                )
             ]
-        return {"B2_ACCOUNT_ID": creds[0], "B2_APPLICATION_KEY": creds[1]}, []
+        return {"BACKEND_PASSWORD": creds[1]}, []
 
     def _run_duplicity(
         self,
         args: list[str],
         passphrase: str | None,
         scroll_lines: int = 0,
-        window: "LiveWindow | None" = None,
+        window: LiveWindow | None = None,
         title: str = "Live output",
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
@@ -605,11 +636,13 @@ class DuplicityMethod(Backend):
 
         # B2 status: never prompt, use only non-interactive credential sources
         b2_env: dict[str, str] = {}
+        b2_aid: str | None = None
         if is_b2:
             aid = self.config.get("b2_account_id", "") or os.environ.get("B2_ACCOUNT_ID", "")
             akey = self.config.get("b2_account_key", "") or os.environ.get("B2_APPLICATION_KEY", "")
             if aid and akey:
-                b2_env = {"B2_ACCOUNT_ID": aid, "B2_APPLICATION_KEY": akey}
+                b2_env = {"BACKEND_PASSWORD": akey}
+                b2_aid = aid
             else:
                 result["passphrase_ready"] = False
 
@@ -621,7 +654,9 @@ class DuplicityMethod(Backend):
             # Single collection-status on the base B2 URL
             if passphrase and b2_env:
                 r = self._run_duplicity(
-                    ["collection-status", self._target_url()], passphrase, extra_env=b2_env,
+                    ["collection-status", self._target_url(account_id=b2_aid)],
+                    passphrase,
+                    extra_env=b2_env,
                 )
                 result["last_backup"] = {
                     "state": "error" if r["errors"] else "completed",

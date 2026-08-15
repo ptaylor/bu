@@ -87,6 +87,11 @@ bu <ACTION> <DESTINATION> [OPTIONS...]
   - encrypted `b2_account_id_enc` / `b2_account_key_enc` — armored GPG blobs
     from `bu encrypt` (crypto via the `gpg` binary in `src/bu/crypto.py` — no
     `cryptography` package; it doesn't build on this platform).
+- duplicity 3.x ignores `B2_ACCOUNT_ID`/`B2_APPLICATION_KEY` env vars. It reads
+  the account ID from the URL username (`b2://<account_id>@bucket/path`) and the
+  application key from the `BACKEND_PASSWORD` env var. `_target_url` embeds the
+  account ID; `_b2_env` forwards the key as `BACKEND_PASSWORD`; resolved creds
+  are cached on the backend instance.
 - Status file strategy mirrors rsync: local → `<destination>/bu-<NAME>-status.txt`,
   B2 → `~/.local/state/bu/status/bu-<NAME>-status.txt`. `bu status` falls back
   to this file when it can't run `collection-status`.
