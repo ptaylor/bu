@@ -701,24 +701,45 @@ class DuplicityMethod(Backend):
             else:
                 result["passphrase_ready"] = False
 
-        # Collection status per archive, if backup exists and passphrase known
-        archives = [] if is_b2 else self._archive_subdirs()
+        # Collection status per archive, if backup exists and passphrase known.
+        # B2 chains live under per-source subdirectories, so list those from
+        # the configured source basenames (the names used for backups).
+        if is_b2:
+            subdirs: list[str] = []
+            for sp in source_paths:
+                bn = Path(sp).expanduser().name
+                if bn not in subdirs:
+                    subdirs.append(bn)
+            archives = subdirs
+        else:
+            archives = self._archive_subdirs()
         result["archives"] = archives
 
         if is_b2:
-            # Single collection-status on the base B2 URL
-            if passphrase and b2_env:
-                r = self._run_duplicity(
-                    ["collection-status", self._target_url(account_id=b2_aid)],
-                    passphrase,
-                    extra_env=b2_env,
-                )
-                result["last_backup"] = {
-                    "state": "error" if r["errors"] else "completed",
-                    "timestamp": "",
-                    "output": r.get("stdout", "").strip()[:500],
-                    "errors": r["errors"],
-                }
+            if passphrase and b2_env and archives:
+                combined_output: list[str] = []
+                combined_errors: list[str] = []
+                for subdir in archives:
+                    r = self._run_duplicity(
+                        ["collection-status", self._target_url(subdir, account_id=b2_aid)],
+                        passphrase,
+                        extra_env=b2_env,
+                    )
+                    combined_output.append(f"--- {subdir} ---")
+                    combined_output.append(r.get("stdout", "").strip())
+                    combined_errors.extend(r["errors"])
+                lock_errors = [e for e in combined_errors if "already running" in e]
+                if lock_errors and len(lock_errors) == len(combined_errors):
+                    # A backup is in progress — fall back to the status file
+                    # written by the running instance instead of an error.
+                    result["last_backup"] = None
+                else:
+                    result["last_backup"] = {
+                        "state": "error" if combined_errors else "completed",
+                        "timestamp": "",
+                        "output": "\n".join(combined_output)[:500],
+                        "errors": combined_errors,
+                    }
             else:
                 result["last_backup"] = None
         elif archives and passphrase:
@@ -731,12 +752,18 @@ class DuplicityMethod(Backend):
                 combined_output.append(f"--- {subdir} ---")
                 combined_output.append(r.get("stdout", "").strip())
                 combined_errors.extend(r["errors"])
-            result["last_backup"] = {
-                "state": "error" if combined_errors else "completed",
-                "timestamp": "",
-                "output": "\n".join(combined_output)[:500],
-                "errors": combined_errors,
-            }
+            lock_errors = [e for e in combined_errors if "already running" in e]
+            if lock_errors and len(lock_errors) == len(combined_errors):
+                # A backup is in progress — fall back to the status file
+                # written by the running instance instead of an error.
+                result["last_backup"] = None
+            else:
+                result["last_backup"] = {
+                    "state": "error" if combined_errors else "completed",
+                    "timestamp": "",
+                    "output": "\n".join(combined_output)[:500],
+                    "errors": combined_errors,
+                }
         else:
             result["last_backup"] = None
 

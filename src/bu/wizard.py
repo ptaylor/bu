@@ -441,10 +441,10 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             extra["full_if_older_than"] = raw
         verbosity = pick(
             "How verbose should duplicity be?",
-            ["Verbose (9)", "Quiet (0)"],
+            ["Verbose (6)", "Quiet (0)"],
             default_index=0,
         )
-        extra["verbosity"] = "0" if verbosity == "Quiet (0)" else "9"
+        extra["verbosity"] = "0" if verbosity == "Quiet (0)" else "6"
 
     # ------------------------------------------------------------------
     # 9. Exclusion files — global + per-name, created on demand

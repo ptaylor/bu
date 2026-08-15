@@ -62,7 +62,7 @@ b2_account_key = "..."
 # Optional duplicity settings
 passphrase_file = "~/.config/bu/secrets/docs.pass"   # GPG passphrase (file, env, or prompt)
 full_if_older_than = "30D"                           # full-backup cadence
-verbosity = 9                                        # 0 = quiet, 9 = verbose
+verbosity = 6                                        # 0 = quiet, 6 = list files, 9 = debug
 ```
 
 ### Config reference
@@ -77,7 +77,7 @@ verbosity = 9                                        # 0 = quiet, 9 = verbose
 | `exclude_files` | No | List of exclusion files; defaults to `exclude.txt` (global) + `exclude-NAME.txt` (per destination) |
 | `passphrase_file` | No | duplicity: file whose first line holds the GPG passphrase (perms 0600) |
 | `full_if_older_than` | No | duplicity: force a full backup when the last one is older than this (e.g. `"30D"`) |
-| `verbosity` | No | duplicity: output verbosity 0-9 (default: automatic) |
+| `verbosity` | No | duplicity: output verbosity 0-9 (default: automatic; 9 is debug-level and very noisy) |
 | `b2_account_id` / `b2_account_key` | No | Backblaze B2 credentials, plaintext |
 | `b2_account_id_enc` / `b2_account_key_enc` | No | Backblaze B2 credentials, encrypted via `bu encrypt` |
 

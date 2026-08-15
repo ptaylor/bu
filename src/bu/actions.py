@@ -22,7 +22,7 @@ else:
 
 from bu.backends import get_backend
 from bu.backends.duplicity import condense_stderr
-from bu.config import Config, ConfigError, DestinationConfig, VALID_NAME_RE
+from bu.config import VALID_NAME_RE, Config, DestinationConfig
 from bu.logging import ActionLogger, group_entries, read_log
 
 # Per-method sample configs used when creating a new destination file.
@@ -176,6 +176,28 @@ def _write_backup_summary(
     out.flush()
 
 
+def _touch_log_start(
+    dest: DestinationConfig,
+    action: str,
+    start_ts: datetime.datetime,
+) -> None:
+    """Write a running-state marker to the raw log when an action starts.
+
+    The full entry (stats, errors, output) is appended when the action
+    ends; this marker guarantees the log exists even if a run is still
+    going or is killed midway.
+    """
+    log_path = dest.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as fh:
+        fh.write(f"{'=' * 60}\n")
+        fh.write(f"Action      : {action}\n")
+        fh.write(f"Destination : {dest.name}\n")
+        fh.write(f"Method      : {dest.method}\n")
+        fh.write(f"Started     : {start_ts.isoformat()}\n")
+        fh.write("State       : running\n\n")
+
+
 def action_backup(
     dest: DestinationConfig,
     *,
@@ -190,6 +212,7 @@ def action_backup(
     logger.start("backup", dest.name)
 
     _write_action_header(dest, "backup", start_ts)
+    _touch_log_start(dest, "backup", start_ts)
 
     backend = _build_backend(dest)
     result = backend.backup(dest.source_paths, dry_run=dry_run, extra_args=extra_args, scroll_lines=scroll_lines)
@@ -237,7 +260,7 @@ def _write_raw_log(
     if restore_to:
         lines.append(f"Restore to  : {restore_to}")
     else:
-        lines.append(f"Source paths:")
+        lines.append("Source paths:")
         for sp in dest.source_paths:
             lines.append(f"  {sp}")
         lines.append(f"Dest path   : {dest.destination}")
@@ -300,6 +323,7 @@ def action_restore(
     logger.start("restore", dest.name)
 
     _write_action_header(dest, "restore", start_ts, restore_to=restore_path)
+    _touch_log_start(dest, "restore", start_ts)
 
     backend = _build_backend(dest)
     result = backend.restore(
@@ -441,8 +465,10 @@ def action_config(
             "ok": False,
             "name": name,
             "errors": [
-                f"Invalid name {name!r} — names may only "
-                "contain letters, digits, '-' and '_'."
+                (
+                    f"Invalid name {name!r} — names may only "
+                    "contain letters, digits, '-' and '_'."
+                )
             ],
         }
 
@@ -552,9 +578,11 @@ def action_config(
             "created": created,
             "file": str(file_path),
             "errors": [
-                f"Destination {raw_dest!r} looks like a remote URL, but "
-                "method = 'rsync' only copies to local directories. "
-                "Use method = 'duplicity' for remote targets (e.g. b2://bucket/path)."
+                (
+                    f"Destination {raw_dest!r} looks like a remote URL, but "
+                    "method = 'rsync' only copies to local directories. "
+                    "Use method = 'duplicity' for remote targets (e.g. b2://bucket/path)."
+                )
             ],
         }
 
@@ -565,8 +593,10 @@ def action_config(
             "created": created,
             "file": str(file_path),
             "errors": [
-                f"Destination {raw_dest!r} looks like a malformed URL. "
-                "URLs need '://' — e.g. b2://bucket-name/path."
+                (
+                    f"Destination {raw_dest!r} looks like a malformed URL. "
+                    "URLs need '://' — e.g. b2://bucket-name/path."
+                )
             ],
         }
 
@@ -711,7 +741,7 @@ def format_history(result: dict[str, Any], json_output: bool = False) -> str:
             if key in extra:
                 stats.append(f"{extra[key]} {label}")
         for label, key in [("size", "bytes_copied"), ("size", "bytes_restored")]:
-            if key in extra and extra[key]:
+            if extra.get(key):
                 stats.append(_format_size(extra[key]))
         if extra.get("dry_run"):
             stats.append("dry-run")

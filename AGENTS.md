@@ -119,7 +119,9 @@ bu ACTION NAME [ARGS...]
 - `~/.local/state/bu/history/<name>.json` — structured JSON-lines action history
   (`ActionLogger` in `src/bu/logging.py`).
 - `~/.local/state/bu/logs/<name>.log` — raw execution log (override base dir
-  with `BU_LOG_DIR`). Duplicity stderr is condensed in logs too.
+  with `BU_LOG_DIR`). A "State: running" marker entry is written when an action
+  starts, so the log exists even mid-run; the full entry is appended at the end.
+  Duplicity stderr is condensed in logs too.
 - Defaults honor `XDG_STATE_HOME`.
 
 ## Codebase conventions

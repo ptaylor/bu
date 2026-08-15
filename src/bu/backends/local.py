@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
 
@@ -33,7 +33,7 @@ class RsyncMethod(Backend):
     """
 
     # Default rsync flags used for every backup run.
-    RSYNC_FLAGS = [
+    RSYNC_FLAGS: ClassVar[list[str]] = [
         "-a",         # archive mode: preserve permissions, times, symlinks
         "--delete",   # remove files in dest that are not in source
         "-h",         # human-readable sizes in output
@@ -263,7 +263,7 @@ class RsyncMethod(Backend):
         dry_run: bool,
         delete: bool = True,
         scroll_lines: int = 0,
-        window: "LiveWindow | None" = None,
+        window: LiveWindow | None = None,
         title: str = "Live output",
         exclude: str | None = None,
         exclude_from: list[str] | None = None,

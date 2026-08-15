@@ -9,8 +9,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 
 class StreamResult:
@@ -55,7 +54,7 @@ class LiveWindow:
 
     # -- context management ---------------------------------------------
 
-    def __enter__(self) -> "LiveWindow":
+    def __enter__(self) -> Self:
         if self.lines <= 0 or not sys.stdout.isatty():
             return self
         try:
@@ -121,7 +120,7 @@ class LiveWindow:
             return f"\033[36m{row}\033[0m"          # cyan
         if row.endswith("/") or row == "./":
             return f"\033[34m{row}\033[0m"          # blue
-        if row.startswith("Transfer starting") or row.startswith("Number of"):
+        if row.startswith(("Transfer starting", "Number of")):
             return f"\033[32m{row}\033[0m"          # green
         return row
 
@@ -155,7 +154,7 @@ def run_streaming(
     cmd: list[str],
     env: dict[str, str] | None = None,
     scroll_lines: int = 0,
-    window: "LiveWindow | None" = None,
+    window: LiveWindow | None = None,
     title: str = "Live output",
     silence_stderr: bool = False,
 ) -> StreamResult:

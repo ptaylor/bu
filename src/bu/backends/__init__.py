@@ -4,10 +4,10 @@ Each method module provides a class implementing the Backend interface.
 """
 
 from bu.backends.base import Backend
-from bu.backends.local import RsyncMethod
 from bu.backends.duplicity import DuplicityMethod
+from bu.backends.local import RsyncMethod
 
-__all__ = ["Backend", "RsyncMethod", "DuplicityMethod"]
+__all__ = ["Backend", "DuplicityMethod", "RsyncMethod"]
 
 # Registry of method name -> class
 REGISTRY: dict[str, type[Backend]] = {
