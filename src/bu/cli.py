@@ -403,9 +403,11 @@ def create(config_dir: Path | None, name: str | None) -> None:
     """Interactively create a new destination configuration.
 
     A guided wizard prompts for the destination name (unless NAME is
-    given), method, source paths, destination, and method-specific
-    options (B2 credentials, GPG passphrase).  Invalid answers are
-    rejected and re-prompted; choices use numbered, arrow-key menus.
+    given), backup type (DIR or B2), destination (local directory, or
+    B2 bucket/path and credentials), method (rsync/duplicity for DIR,
+    duplicity-only for B2), source paths, and method-specific options
+    (GPG passphrase).  Invalid answers are rejected and re-prompted;
+    choices use numbered, arrow-key menus.
     """
     from bu.wizard import run_create_wizard
 

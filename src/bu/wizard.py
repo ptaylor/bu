@@ -1,8 +1,8 @@
 """Interactive 'bu create' wizard for generating destination configs.
 
-Each prompt takes previous answers into account: the method determines
-which destination formats are valid, a b2:// destination triggers B2
-credential prompts, and duplicity triggers the GPG passphrase question.
+Flow: backup type (DIR or B2) → destination (local directory for DIR, or
+B2 bucket/path plus credentials for B2) → method (rsync/duplicity for DIR,
+duplicity-only for B2) → source paths → duplicity-specific options.
 Every answer is validated and re-prompted until it is correct.
 
 Choice menus are numbered and arrow-key scrollable when running on a TTY;
@@ -198,43 +198,18 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             break
 
     # ------------------------------------------------------------------
-    # 2. Method (drives all later prompts)
+    # 2. Backup type — drives the destination and method prompts
     # ------------------------------------------------------------------
-    method = pick("Method:", ["rsync", "duplicity"], default_index=0)
+    backup_type = pick("Backup type:", ["DIR", "B2"], default_index=0)
 
     # ------------------------------------------------------------------
-    # 3. Source paths
+    # 3. Destination — DIR asks for a local directory, B2 for bucket details
     # ------------------------------------------------------------------
-    print("Source paths (directories to back up):")
-    sources: list[str] = []
-    while True:
-        label = "  path" if sources else "  path (required)"
-        raw = input(f"{label}: ").strip()
-        if not raw:
-            if sources:
-                break
-            print("  At least one source path is required.")
-            continue
-        p = Path(raw).expanduser()
-        if not p.exists():
-            print(f"  Not found: {raw}")
-            continue
-        if not p.is_dir():
-            print(f"  Not a directory: {raw}")
-            continue
-        sources.append(str(Path(raw).expanduser()))
-        if not _prompt_yes_no("  add another source?"):
-            break
-
-    # ------------------------------------------------------------------
-    # 4. Destination — depends on method
-    # ------------------------------------------------------------------
-    if method == "rsync":
+    if backup_type == "DIR":
         while True:
             raw = input("  destination directory: ").strip()
-            if re.match(r"^\w{2,}:", raw):
-                print("  rsync is local-only — for remote URLs use method "
-                      "'duplicity' (e.g. b2://bucket/path).")
+            if not raw:
+                print("  A destination directory is required.")
                 continue
             p = Path(raw).expanduser()
             if not p.exists():
@@ -254,38 +229,26 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
                 continue
             dest = str(Path(raw).expanduser())
             break
-    else:  # duplicity
+    else:  # B2
+        print(f"Backblaze B2 destination for {name!r}:")
         while True:
-            raw = input("  destination (local dir or URL, e.g. b2://bucket/path): ").strip()
-            scheme = re.match(r"^(\w{2,})://", raw)
-            if ":" in raw and not scheme:
-                print("  Malformed URL — URLs need '://' (e.g. b2://bucket/path).")
+            bucket = input("  bucket name: ").strip()
+            if not bucket:
+                print("  Bucket name is required.")
                 continue
-            if scheme:
-                dest = raw
-                break
-            p = Path(raw).expanduser()
-            if not p.exists():
-                if _prompt_yes_no(f"  {p} does not exist — create it?"):
-                    try:
-                        p.mkdir(parents=True)
-                    except OSError as e:
-                        print(f"  Cannot create {p}: {e}")
-                        continue
-                else:
-                    continue
-            if not p.is_dir():
-                print(f"  Not a directory: {p}")
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9-]*$", bucket):
+                print("  Bucket names use letters, digits, and hyphens — no spaces or slashes.")
                 continue
-            dest = str(Path(raw).expanduser())
             break
+        bpath = _prompt("  path within bucket (blank = bucket root)")
+        dest = f"b2://{bucket}/{bpath}" if bpath else f"b2://{bucket}"
 
     extra: dict[str, str] = {}
 
     # ------------------------------------------------------------------
-    # 5. B2 credentials — only for b2:// destinations
+    # 4. B2 credentials — always for B2 destinations
     # ------------------------------------------------------------------
-    if method == "duplicity" and dest.startswith("b2://"):
+    if backup_type == "B2":
         print(f"Backblaze B2 credentials for {name!r}:")
         mode = pick("  store as:", ["plaintext", "encrypted"], default_index=0)
         while True:
@@ -317,7 +280,40 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             extra["b2_account_key"] = akey
 
     # ------------------------------------------------------------------
-    # 6. GPG passphrase — duplicity only
+    # 5. Method — DIR offers both, B2 is always duplicity
+    # ------------------------------------------------------------------
+    if backup_type == "DIR":
+        method = pick("Method:", ["rsync", "duplicity"], default_index=0)
+    else:
+        method = "duplicity"
+        print("Method: duplicity (B2 backups always use duplicity)")
+
+    # ------------------------------------------------------------------
+    # 6. Source paths
+    # ------------------------------------------------------------------
+    print("Source paths (directories to back up):")
+    sources: list[str] = []
+    while True:
+        label = "  path" if sources else "  path (required)"
+        raw = input(f"{label}: ").strip()
+        if not raw:
+            if sources:
+                break
+            print("  At least one source path is required.")
+            continue
+        p = Path(raw).expanduser()
+        if not p.exists():
+            print(f"  Not found: {raw}")
+            continue
+        if not p.is_dir():
+            print(f"  Not a directory: {raw}")
+            continue
+        sources.append(str(Path(raw).expanduser()))
+        if not _prompt_yes_no("  add another source?"):
+            break
+
+    # ------------------------------------------------------------------
+    # 7. GPG passphrase — duplicity only
     # ------------------------------------------------------------------
     if method == "duplicity":
         choice = pick("  GPG passphrase handling:", ["prompt", "file"], default_index=0)
@@ -333,7 +329,7 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             extra["passphrase_file"] = str(Path(pf).expanduser())
 
     # ------------------------------------------------------------------
-    # 7. Optional duplicity settings
+    # 8. Optional duplicity settings
     # ------------------------------------------------------------------
     if method == "duplicity":
         if raw := _prompt("  full_if_older_than (e.g. 30D, blank = default)"):
@@ -345,7 +341,7 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
                 print("  Ignored invalid verbosity (must be 0-9).")
 
     # ------------------------------------------------------------------
-    # 8. Assemble and write the config
+    # 9. Assemble and write the config
     # ------------------------------------------------------------------
     history_path = str(_default_history_dir() / f"{name}.json")
     log_path = str(_default_raw_log_dir() / f"{name}.log")
