@@ -40,6 +40,9 @@ class RsyncMethod(Backend):
         "--stats",    # print a statistics summary at the end
     ]
 
+    # Method name recorded in status files and reports.
+    METHOD_NAME: ClassVar[str] = "rsync"
+
     def _dest_dir(self) -> Path:
         """Return the destination directory (sources are mirrored directly into it)."""
         base = self.config.get("destination", "")
@@ -56,7 +59,7 @@ class RsyncMethod(Backend):
         """Write (or overwrite) bu-<name>-status.txt with the current backup state."""
         status: dict[str, Any] = {
             "destination": self.config.get("_name", "unknown"),
-            "method": "rsync",
+            "method": self.METHOD_NAME,
             "source_paths": self.config.get("_source_paths", []),
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "state": state,
@@ -267,13 +270,16 @@ class RsyncMethod(Backend):
         title: str = "Live output",
         exclude: str | None = None,
         exclude_from: list[str] | None = None,
+        link_dest: str | None = None,
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
         ``delete=False`` keeps the restore non-destructive; ``exclude``
         skips a file/directory name (used to keep the bu status file out
         of restores); ``exclude_from`` lists exclusion files to pass via
-        ``--exclude-from``.
+        ``--exclude-from``; ``link_dest`` adds ``--link-dest=<dir>`` so
+        unchanged files are hard-linked from a previous backup (snapshot
+        method).
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
@@ -294,7 +300,10 @@ class RsyncMethod(Backend):
             cmd.append(f"--exclude-from={ef}")
         if dry_run:
             cmd.append("--dry-run")
-        cmd.append(f"{src}/")
+        if link_dest:
+            cmd.append(f"--link-dest={link_dest}")
+        # Trailing slash on directories: copy *contents*, not the dir itself.
+        cmd.append(f"{src}/" if src.is_dir() else str(src))
         cmd.append(str(dest))
 
         try:
@@ -348,7 +357,7 @@ class RsyncMethod(Backend):
 
         result: dict[str, Any] = {
             "name": name,
-            "method": "rsync",
+            "method": self.METHOD_NAME,
             "config_ok": True,
             "source_paths": source_paths,
             "dest_path": str(dest_dir),

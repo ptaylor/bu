@@ -87,7 +87,7 @@ def _default_window() -> int:
 )
 @click.pass_context
 def main(ctx: click.Context) -> None:
-    """bu — Backup utility for managing backups via rsync or duplicity.
+    """bu — Backup utility for managing backups via rsync, duplicity, or snapshot.
 
     Run 'bu help ACTION' for details on each action.
     """
@@ -325,8 +325,8 @@ def create(name: str | None) -> None:
 
     A guided wizard prompts for the destination name (unless NAME is
     given), backup type (DIR or B2), destination (local directory, or
-    B2 bucket/path and credentials), method (rsync/duplicity for DIR,
-    duplicity-only for B2), source paths, and method-specific options
+    B2 bucket/path and credentials), method (rsync/duplicity/snapshot for
+    DIR, duplicity-only for B2), source paths, and method-specific options
     (GPG passphrase).  It also sets up global and per-name exclusion
     files.  Invalid answers are rejected and re-prompted; choices use
     numbered, arrow-key menus.

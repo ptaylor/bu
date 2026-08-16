@@ -1,8 +1,9 @@
 """Interactive 'bu create' wizard for generating destination configs.
 
 Flow: backup type (DIR or B2) → destination (local directory for DIR, or
-B2 bucket/path plus credentials for B2) → method (rsync/duplicity for DIR,
-duplicity-only for B2) → source paths → duplicity-specific options →
+B2 bucket/path plus credentials for B2) → method (rsync/duplicity/snapshot
+for DIR, duplicity-only for B2; snapshot destinations are checked for
+hard-link support) → source paths → duplicity-specific options →
 exclusion files (global + per-name).
 Every answer is validated and re-prompted until it is correct.
 
@@ -23,6 +24,7 @@ import tty
 from pathlib import Path
 from typing import Any
 
+from bu.backends.snapshot import check_hardlink_support
 from bu.config import VALID_NAME_RE, Config, _default_history_dir, _default_raw_log_dir
 from bu.crypto import CryptoError, encrypt_secret
 
@@ -78,6 +80,32 @@ def _prompt_yes_no(prompt: str, default: str = "n") -> bool:
         if raw in ("n", "no", ""):
             return False
         _error("Please answer y or n.")
+
+
+def _prompt_local_destination() -> str:
+    """Prompt for and validate a writable local destination directory."""
+    while True:
+        raw = _prompt("destination directory")
+        if not raw:
+            _error("A destination directory is required.")
+            continue
+        p = Path(raw).expanduser()
+        if not p.exists():
+            if _prompt_yes_no(f"{p} does not exist — create it?"):
+                try:
+                    p.mkdir(parents=True)
+                except OSError as e:
+                    _error(f"Cannot create {p}: {e}")
+                    continue
+            else:
+                continue
+        if not p.is_dir():
+            _error(f"Not a directory: {p}")
+            continue
+        if not os.access(p, os.W_OK):
+            _error(f"Not writable: {p}")
+            continue
+        return str(Path(raw).expanduser())
 
 
 # ----------------------------------------------------------------------
@@ -304,29 +332,7 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     # ------------------------------------------------------------------
     _section("Destination")
     if not is_b2:
-        while True:
-            raw = _prompt("destination directory")
-            if not raw:
-                _error("A destination directory is required.")
-                continue
-            p = Path(raw).expanduser()
-            if not p.exists():
-                if _prompt_yes_no(f"{p} does not exist — create it?"):
-                    try:
-                        p.mkdir(parents=True)
-                    except OSError as e:
-                        _error(f"Cannot create {p}: {e}")
-                        continue
-                else:
-                    continue
-            if not p.is_dir():
-                _error(f"Not a directory: {p}")
-                continue
-            if not os.access(p, os.W_OK):
-                _error(f"Not writable: {p}")
-                continue
-            dest = str(Path(raw).expanduser())
-            break
+        dest = _prompt_local_destination()
     else:  # B2
         while True:
             bucket = _prompt("bucket name")
@@ -378,14 +384,33 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             extra["b2_account_key"] = akey
 
     # ------------------------------------------------------------------
-    # 5. Method — DIR offers both, B2 is always duplicity
+    # 5. Method — DIR offers three, B2 is always duplicity
     # ------------------------------------------------------------------
     _section("Backup method")
     if not is_b2:
-        method = pick("Backup method:", ["rsync", "duplicity"], default_index=0)
+        method_values = ["snapshot", "rsync", "duplicity"]
+        method_labels = [
+            "Snapshot (rsync; requires hard link file system support)",
+            "Rsync",
+            "Duplicity",
+        ]
+        choice = pick("Backup method:", method_labels, default_index=0)
+        method = method_values[method_labels.index(choice)]
     else:
         method = "duplicity"
         print(_paint("dim", "  duplicity — B2 backups are always encrypted with duplicity"))
+
+    if method == "snapshot":
+        _note("each backup creates a new UTC-timestamped snapshot directory")
+        _note("unchanged files are hard-linked to the previous snapshot (rsync --link-dest)")
+        while True:
+            link_errors = check_hardlink_support(Path(dest).expanduser())
+            if not link_errors:
+                break
+            _error(link_errors[0])
+            _note("the destination filesystem does not support hard links — pick another one")
+            dest = _prompt_local_destination()
+            print(_paint("green", f"  ✓ {dest}"))
 
     # ------------------------------------------------------------------
     # 6. Source paths

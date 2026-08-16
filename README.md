@@ -1,7 +1,7 @@
 # bu
 
-Backup utility that mirrors directories with rsync, or encrypted incremental
-duplicity archives (local disk or Backblaze B2).
+Backup utility that mirrors directories with rsync, timestamped hard-linked
+snapshots, or encrypted incremental duplicity archives (local disk or Backblaze B2).
 
 ## Usage
 
@@ -65,11 +65,32 @@ full_if_older_than = "30D"                           # full-backup cadence
 verbosity = 6                                        # 0 = quiet, 6 = list files, 9 = debug
 ```
 
+### Example: `~/.config/bu/notes.toml` (timestamped hard-linked snapshots)
+
+```toml
+method = "snapshot"
+source_paths = [
+    "~/notes",
+]
+destination = "/mnt/backup"
+```
+
+Each backup creates a new `destination/<UTC timestamp>/` (e.g.
+`2026-08-15-21.09.41`) holding every source in its own subdirectory.
+Unchanged files are hard-linked to the previous snapshot via
+`rsync --link-dest`, so many timestamped backups share the same disk
+blocks. The destination filesystem must support hard links.
+
+> rsync decides whether a file is unchanged by size and modification time.
+> A file changed within the same second as the previous backup — to the
+> same size — is treated as unchanged and hard-linked (the same limitation
+> as rsync's default quick check and rsnapshot).
+
 ### Config reference
 
 | Key | Required | Description |
 |-----|----------|-------------|
-| `method` | Yes | `"rsync"` or `"duplicity"` |
+| `method` | Yes | `"rsync"`, `"duplicity"`, or `"snapshot"` |
 | `source_paths` | Yes | Array of directory paths to back up |
 | `destination` | Yes | Base target directory, or a `b2://bucket/path` URL (duplicity only) |
 | `history_file` | No | Path to structured JSON-lines action history |
@@ -84,6 +105,9 @@ verbosity = 6                                        # 0 = quiet, 6 = list files
 For `rsync`, each source is mirrored directly into `destination/<source name>`.
 For `duplicity`, each source gets its own encrypted archive under the same
 layout.
+For `snapshot`, each backup creates `destination/<UTC timestamp>/<source name>/`;
+unchanged files are hard-linked from the previous snapshot via
+`rsync --link-dest` (the destination filesystem must support hard links).
 
 ### Exclusions
 
@@ -131,8 +155,10 @@ bu create photos
 
 The interactive wizard asks for the backup type (Directory or Backblaze B2),
 destination, credentials, method, and source paths, then writes the config.
-It also sets `exclude_files` to the global and per-name exclusion files,
-creating both (with sensible defaults) if neither exists yet.
+For snapshot destinations it verifies hard-link support on the destination
+before writing the config. It also sets `exclude_files` to the global and
+per-name exclusion files, creating both (with sensible defaults) if neither
+exists yet.
 Alternatively, `bu config photos` opens `$EDITOR` (default `vi`) with a
 pre-filled template; after saving, the TOML is validated.
 
@@ -153,6 +179,8 @@ Per-destination runtime files are stored under `~/.local/state/bu/`:
 ## Requirements
 
 - `rsync` — for `method = "rsync"` destinations
+- `rsync` and a hard-link-capable filesystem — for `method = "snapshot"`
+  destinations
 - `duplicity` (3.x) and `gpg` — for `method = "duplicity"` destinations
   (local disk or Backblaze B2)
 
@@ -183,6 +211,10 @@ bu restore photos ./restore
 
 # Or restore just one folder within the backup
 bu restore photos ./restore Photos
+
+# snapshot destinations restore from the newest snapshot by default;
+# a timestamp PATH picks an older one
+bu restore notes ./restore 2026-08-15-21.09.41
 
 # View action history
 bu history photos

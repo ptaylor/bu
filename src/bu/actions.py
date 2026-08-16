@@ -66,9 +66,28 @@ destination = "/mnt/backup/docs"            # or "b2://bucket-name/path"
 {log_file}
 """
 
+_SAMPLE_SNAPSHOT = """\
+# snapshot method — timestamped rsync mirrors linked to the previous snapshot
+method = "snapshot"
+source_paths = [
+    "~/Documents",
+    "~/notes",
+]
+destination = "/mnt/backup/docs"
+# Each backup creates a new "<destination>/<YYYY-MM-DD-HH.MM.SS>/" snapshot (UTC);
+# unchanged files are hard-linked from the previous snapshot (rsync --link-dest).
+# The destination filesystem must support hard links.
+# exclude_files = [
+#     "~/.config/bu/exclude.txt",
+#     "~/.config/bu/exclude-docs.txt",
+# ]   # omitted: defaults to those two files (missing files are ignored)
+{history_file}
+{log_file}
+"""
+
 _SAMPLE_GENERIC = """\
 # bu destination configuration
-# method = "rsync"   # or "duplicity"
+# method = "rsync"   # "duplicity" or "snapshot"
 # source_paths = [
 #     "/path/to/backup",
 # ]
@@ -408,6 +427,7 @@ def _sample_for_method(method: str, name: str) -> str:
     samples: dict[str, str] = {
         "rsync": _SAMPLE_RSYNC,
         "duplicity": _SAMPLE_DUPLICITY,
+        "snapshot": _SAMPLE_SNAPSHOT,
     }
     template = samples.get(method, _SAMPLE_GENERIC)
     return template.format(history_file=history_line, log_file=log_line)
@@ -535,16 +555,16 @@ def action_config(
             "name": name,
             "created": created,
             "file": str(file_path),
-            "errors": ["Missing required 'method' key. Must be one of: rsync, duplicity."],
+            "errors": ["Missing required 'method' key. Must be one of: rsync, duplicity, snapshot."],
         }
 
-    if raw_method not in ("rsync", "duplicity"):
+    if raw_method not in ("rsync", "duplicity", "snapshot"):
         return {
             "ok": False,
             "name": name,
             "created": created,
             "file": str(file_path),
-            "errors": [f"Unknown method {raw_method!r}. Must be one of: rsync, duplicity."],
+            "errors": [f"Unknown method {raw_method!r}. Must be one of: rsync, duplicity, snapshot."],
         }
 
     source_paths = raw.get("source_paths", [])
@@ -571,7 +591,7 @@ def action_config(
     url_match = re.match(r"^\w{2,}://", raw_dest)     # proper URL like b2://…
     scheme_match = re.match(r"^\w{2,}:", raw_dest)    # any scheme-like prefix
 
-    if raw_method == "rsync" and scheme_match:
+    if raw_method in ("rsync", "snapshot") and scheme_match:
         return {
             "ok": False,
             "name": name,
@@ -580,7 +600,7 @@ def action_config(
             "errors": [
                 (
                     f"Destination {raw_dest!r} looks like a remote URL, but "
-                    "method = 'rsync' only copies to local directories. "
+                    f"method = {raw_method!r} only copies to local directories. "
                     "Use method = 'duplicity' for remote targets (e.g. b2://bucket/path)."
                 )
             ],
@@ -810,6 +830,15 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
 
     lines.append(f"Dest path    : {result.get('dest_path', '?')}")
     lines.append(f"Dest exists  : {'yes' if result.get('dest_exists') else 'no'}")
+
+    snap_count = result.get("snapshot_count")
+    if snap_count is not None:
+        snapshots = result.get("snapshots") or []
+        latest = result.get("latest_snapshot")
+        lines.append(f"Snapshots    : {snap_count}")
+        for snap in reversed(list(snapshots)[-3:]):
+            marker = " ← latest" if snap == latest else ""
+            lines.append(f"  {snap}{marker}")
 
     last = result.get("last_backup")
     if last is None:

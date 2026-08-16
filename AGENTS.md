@@ -1,8 +1,9 @@
 # AGENTS.md
 
 Guidance for AI coding agents working on **bu** — a backup utility (Python, click
-CLI) that backs up source directories via **rsync** (local) or **duplicity**
-(encrypted, local or Backblaze B2).
+CLI) that backs up source directories via **rsync** (local), **snapshot**
+(hard-linked timestamped local snapshots), or **duplicity** (encrypted, local
+or Backblaze B2).
 
 ## Command format rules
 
@@ -39,14 +40,14 @@ bu ACTION NAME [ARGS...]
 
 - One TOML file per destination under `~/.config/bu/` (override with
   `BU_CONFIG_DIR`). Example: `~/.config/bu/photos.toml`.
-- Required keys: `method` (`"rsync"` or `"duplicity"`), `source_paths`
+- Required keys: `method` (`"rsync"`, `"duplicity"`, or `"snapshot"`), `source_paths`
   (list of directories), `destination` (path or URL).
 - Optional keys: `history_file`, `log_file`, `exclude_files`, plus
   method-specific extras.
 - `exclude_files` (list) defaults to `<config_dir>/exclude.txt` (global) and
   `<config_dir>/exclude-<name>.txt` (per destination); the key replaces the
-  defaults. Missing files are skipped by the backends. Shared rsync/duplicity
-  format: `#` comments, blank lines, one glob per line (`*`, `**`, `?`,
+  defaults. Missing files are skipped by the backends. Shared
+  rsync/duplicity/snapshot format: `#` comments, blank lines, one glob per line (`*`, `**`, `?`,
   `[...]`), `+ ` include / `- ` exclude modifiers. Anchoring mirrors rsync: a
   leading `/` or any pattern containing `/` is anchored to the top level of
   each source; bare patterns match at any depth. rsync gets the file as-is;
@@ -69,7 +70,8 @@ bu ACTION NAME [ARGS...]
   ```
 
 - `bu config NAME` validates the TOML after `$EDITOR` closes:
-  rsync + URL-ish destination → error ("rsync is local-only");
+  rsync/snapshot + URL-ish destination → error ("rsync and snapshot are
+  local-only");
   duplicity with `b2:/...` (missing `//`) → error.
 
 ## Method patterns
@@ -85,6 +87,30 @@ bu ACTION NAME [ARGS...]
 - Status file: `<destination>/bu-<NAME>-status.txt` (JSON content), written at
   backup start/end (`started`/`completed`/`error`). Dry-runs write nothing.
   The status file is NOT synced back on restore.
+
+### snapshot (`src/bu/backends/snapshot.py`)
+
+- Local directories only. `destination = "/mnt/backup"`.
+- Each backup creates `<destination>/<YYYY-MM-DD-HH.MM.SS>/` (UTC
+  `%Y-%m-%d-%H.%M.%S`; same-second collisions get `-2`, `-3` suffixes),
+  containing `<source basename>/` per source (duplicate basenames deduped
+  with `_2` like duplicity).
+- Unchanged files are hard-linked from the newest snapshot containing that
+  source's subdir via `rsync -a --link-dest=<abs path>`; no `--link-dest`
+  on the first backup or for sources added later.  rsync's default quick
+  check compares size and mtime, so a file modified within the same second
+  as the previous backup (same size) is treated as unchanged and
+  hard-linked (same caveat as rsnapshot).
+- Hard-link support is verified by the `bu create` wizard and before the
+  first backup: a random file in the destination is hard-linked to a second
+  random name, the original deleted, and the content of the link checked.
+  Later backups skip the check when `bu-<NAME>-status.txt` already records
+  method `snapshot`.  Failure aborts with an error (FAT/exFAT/SMB targets).
+- Status file: `<destination>/bu-<NAME>-status.txt` (same as rsync) with a
+  `snapshot` key holding the timestamp.  Restore defaults to the latest
+  snapshot; a PATH whose first component is a timestamp selects that
+  snapshot.  Restore never deletes.
+- `bu status` lists the snapshot count and the newest snapshots.
 
 ### duplicity (`src/bu/backends/duplicity.py`)
 

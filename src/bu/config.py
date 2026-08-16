@@ -48,7 +48,7 @@ class ConfigError(Exception):
 _RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file", "exclude_files"})
 
 # Valid method names.
-_VALID_METHODS = frozenset({"rsync", "duplicity"})
+_VALID_METHODS = frozenset({"rsync", "duplicity", "snapshot"})
 
 # Destination names may contain only letters, digits, underscore, dash.
 VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -189,11 +189,11 @@ class Config:
 
             method = data.get("method", "")
             if not method:
-                errors.append(f"{fp.name}: missing required 'method' key (must be 'rsync' or 'duplicity')")
+                errors.append(f"{fp.name}: missing required 'method' key (must be 'rsync', 'duplicity' or 'snapshot')")
                 continue
 
             if method not in _VALID_METHODS:
-                errors.append(f"{fp.name}: unknown method {method!r} — must be 'rsync' or 'duplicity'")
+                errors.append(f"{fp.name}: unknown method {method!r} — must be 'rsync', 'duplicity' or 'snapshot'")
                 continue
 
             source_paths = data.get("source_paths", [])
