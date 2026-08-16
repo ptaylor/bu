@@ -208,6 +208,7 @@ _GLOBAL_EXCLUDE_TEMPLATE = """\
 #   '*'    within a path component
 #   '**'   across directories
 #   '?'    single character, '[...]' character ranges
+#   '/x' or 'a/b' — anchored to the top level of each source
 #   '+ '   include an exception; a plain line (or '- ') excludes
 #
 # Common developer files

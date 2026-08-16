@@ -105,11 +105,23 @@ Cache
 + .keep     # '+ ' includes an exception; plain lines exclude
 ```
 
-One pattern per line, relative to each source root: `*` matches within a
-path component, `**` matches any depth, `?` and `[...]` work as usual.
-A pattern matching a directory also excludes its contents. The same file
-works for both methods: bu passes it to rsync as-is and translates each
-pattern for duplicity (which requires `**/`-prefixed globs).
+One pattern per line, with identical rules for rsync and duplicity:
+
+- `name` or `*.glob` — matches at **any depth**
+- `**/...` — explicitly any depth
+- `/name`, or any pattern containing `/` (e.g. `Library/Logs`) — anchored to
+the top level of each source
+- `+ ` include / `- ` exclude modifiers; `#` comments and blank lines are ignored
+
+A pattern matching a directory also excludes its contents. bu passes the
+file to rsync as-is and translates each pattern for duplicity (which
+requires `**/`-prefixed globs or source-absolute paths).
+
+> **Watch out:** un-anchored patterns are matched by duplicity against full
+absolute paths, so they also match when a *parent* directory of the source
+has that name — e.g. bare `Library` excludes everything when the source
+itself lives under a `Library` folder. Use `/Library` to anchor the
+exclusion to the source root instead.
 
 ### Creating a config
 

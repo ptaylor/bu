@@ -35,13 +35,12 @@ from bu.crypto import CryptoError, decrypt_secret
 
 
 def translate_exclude_line(line: str) -> tuple[bool, str] | None:
-    """Convert one rsync-style exclusion line into a duplicity (include, glob).
+    """Parse one rsync-style exclusion line into (include, pattern).
 
-    Returns None for blank/comment lines.  duplicity 3.x rejects globs that
-    cannot match the backup base directory (bare names, rooted paths), so
-    plain patterns get a ``**/`` prefix after stripping any leading ``/``;
-    ``**`` patterns pass through unchanged.  ``+ `` / ``- `` modifiers map
-    to duplicity include/exclude.
+    Returns None for blank/comment lines.  ``+ `` / ``- `` modifiers map to
+    duplicity include/exclude.  The pattern is returned raw — anchoring to
+    the source root and ``**/`` prefixing happen per source in
+    ``_exclude_args``.
     """
     line = line.strip()
     if not line or line.startswith("#"):
@@ -55,9 +54,6 @@ def translate_exclude_line(line: str) -> tuple[bool, str] | None:
         pattern = line
     if not pattern:
         return None
-    pattern = pattern.lstrip("/")
-    if not pattern.startswith("**"):
-        pattern = "**/" + pattern
     return include, pattern
 
 
@@ -319,13 +315,16 @@ class DuplicityMethod(Backend):
             ]
         return {"BACKEND_PASSWORD": creds[1]}, []
 
-    def _exclude_args(self) -> list[str]:
+    def _exclude_args(self, source: Path) -> list[str]:
         """Build duplicity include/exclude args from rsync-style exclusion files.
 
-        Each line is translated to a ``**/``-prefixed glob (duplicity 3.x
-        raises FilePrefixError on bare patterns) and passed as
-        ``--include=<glob>`` or ``--exclude=<glob>``.  Missing files are
-        skipped.
+        Each line is translated to a glob (duplicity 3.x raises
+        FilePrefixError on bare patterns) and passed as
+        ``--include=<glob>`` or ``--exclude=<glob>``.  Anchoring mirrors
+        rsync: a leading ``/`` or any pattern containing ``/`` (not counting
+        a trailing slash) is anchored to the resolved source root; other
+        patterns get a ``**/`` prefix (any depth).  ``**`` patterns pass
+        through unchanged.  Missing files are skipped.
         """
         args: list[str] = []
         for path in self.config.get("_exclude_files", []):
@@ -339,6 +338,13 @@ class DuplicityMethod(Backend):
                 if translated is None:
                     continue
                 include, pattern = translated
+                if pattern.startswith("/"):
+                    pattern = f"{source}{pattern}"
+                elif "/" in pattern.rstrip("/"):
+                    # rsync anchors full-path patterns to the source root.
+                    pattern = f"{source}/{pattern}"
+                elif not pattern.startswith("**"):
+                    pattern = "**/" + pattern
                 flag = "--include" if include else "--exclude"
                 args.append(f"{flag}={pattern}")
         return args
@@ -475,9 +481,6 @@ class DuplicityMethod(Backend):
         if b2_errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": b2_errors}
 
-        # Exclusions translated from rsync-style files (missing files ignored).
-        exclude_args = self._exclude_args()
-
         if not dry_run:
             self._write_status("started")
 
@@ -507,6 +510,10 @@ class DuplicityMethod(Backend):
                     candidate = f"{subdir}_{n}"
                     n += 1
                 used_subdirs.add(candidate)
+
+                # Exclusions translated per source: leading-`/` patterns are
+                # anchored to this source's root (missing files are ignored).
+                exclude_args = self._exclude_args(src)
 
                 args: list[str] = []
                 if cadence := self.config.get("full_if_older_than"):

@@ -47,10 +47,15 @@ bu ACTION NAME [ARGS...]
   `<config_dir>/exclude-<name>.txt` (per destination); the key replaces the
   defaults. Missing files are skipped by the backends. Shared rsync/duplicity
   format: `#` comments, blank lines, one glob per line (`*`, `**`, `?`,
-  `[...]`), `+ ` include / `- ` exclude modifiers, patterns relative to each
-  source root. rsync gets the file as-is; duplicity gets each pattern as a
-  translated `**/`-prefixed `--include`/`--exclude` arg (duplicity 3.x rejects
-  bare globs with FilePrefixError).
+  `[...]`), `+ ` include / `- ` exclude modifiers. Anchoring mirrors rsync: a
+  leading `/` or any pattern containing `/` is anchored to the top level of
+  each source; bare patterns match at any depth. rsync gets the file as-is;
+  duplicity gets each pattern translated (`**/`-prefixed globs, or
+  `<source absolute path>` + pattern for anchored ones) as
+  `--include`/`--exclude` args (duplicity 3.x rejects bare globs with
+  FilePrefixError). Un-anchored patterns match absolute paths, so they also
+  fire when a *parent* of the source matches (e.g. bare `Library` kills
+  sources under `~/Library/...`; use `/Library`).
 - `_RESERVED_KEYS` in `src/bu/config.py` lists keys handled by the config layer;
   anything else flows through to the backend as `extra` config.
 - Generated configs (wizard and the `bu config NAME` sample template) must
