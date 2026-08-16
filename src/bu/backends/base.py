@@ -51,11 +51,13 @@ class LiveWindow:
         self._width = 80
         self._start = 0.0
         self._last_status_paint = -1.0
+        self._stop: threading.Event | None = None
+        self._ticker: threading.Thread | None = None
 
     # -- context management ---------------------------------------------
 
     def __enter__(self) -> Self:
-        if self.lines <= 0 or not sys.stdout.isatty():
+        if self.lines <= 0 or not sys.stdout.isatty() or self.active:
             return self
         try:
             self._width = shutil.get_terminal_size().columns
@@ -73,17 +75,38 @@ class LiveWindow:
         self._start = time.monotonic()
         self._last_status_paint = -1.0
         self.active = True
+        self._stop = threading.Event()
+        self._ticker = threading.Thread(target=self._tick, name="bu-livewindow", daemon=True)
+        self._ticker.start()
         return self
 
-    def __exit__(self, *exc) -> bool:
-        if self.active:
+    def _tick(self) -> None:
+        """Background repaint loop.
+
+        Keeps the status line's elapsed-time clock advancing even when the
+        streamed process goes quiet (e.g. duplicity uploading a volume emits
+        nothing for minutes at a time).
+        """
+        while self.active and not self._stop.wait(self.status_interval):
             with self._lock:
+                if not self.active:
+                    break
                 self._redraw()
-                # The cursor sits on the status row after a redraw;
-                # move below it so the final summary prints fresh.
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                self.active = False
+
+    def __exit__(self, *exc) -> bool:
+        if not self.active:
+            return False
+        if self._stop is not None:
+            self._stop.set()
+        if self._ticker is not None:
+            self._ticker.join(timeout=max(1.0, self.status_interval * 2))
+        with self._lock:
+            self._redraw()
+            # The cursor sits on the status row after a redraw;
+            # move below it so the final summary prints fresh.
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.active = False
         return False
 
     def flush(self) -> None:
