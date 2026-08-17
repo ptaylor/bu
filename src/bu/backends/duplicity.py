@@ -485,7 +485,9 @@ class DuplicityMethod(Backend):
             self._write_status("started")
 
         # duplicity 3.x takes exactly one source per invocation, so run
-        # once per source into its own archive subdirectory.
+        # once per source into its own archive subdirectory.  The loop
+        # stops on the first failure — e.g. a bad passphrase would make
+        # every remaining source fail the same way.
         total_files = 0
         total_bytes = 0
         all_errors: list[str] = []
@@ -530,9 +532,16 @@ class DuplicityMethod(Backend):
                 result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
                 total_files += result["files"]
                 total_bytes += result["bytes"]
-                all_errors.extend(result["errors"])
                 all_stdout.append(result.get("stdout", ""))
                 all_stderr.append(result.get("stderr", ""))
+                if result["errors"]:
+                    # Fail fast: a bad passphrase (or any other failure) would
+                    # make every remaining source fail the same way.
+                    all_errors.extend(result["errors"])
+                    all_errors.append(
+                        f"Stopped — remaining sources not backed up after {candidate!r} failed"
+                    )
+                    break
         finally:
             window.__exit__(None, None, None)
 
