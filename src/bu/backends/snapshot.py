@@ -177,8 +177,6 @@ class SnapshotMethod(RsyncMethod):
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
-        exclude_from = self._existing_exclude_files()
-
         # One live window shared across all source runs
         window = LiveWindow(
             scroll_lines,
@@ -205,12 +203,15 @@ class SnapshotMethod(RsyncMethod):
                 if latest := self._latest_snapshot_with(candidate):
                     link_dest = str(latest / candidate)
 
+                window.set_context(str(src))
+                include_rules = self._source_include_rules(idx)
                 result = self._rsync_one(
                     src,
                     snap_dir / candidate,
                     dry_run,
                     window=window,
-                    exclude_from=exclude_from,
+                    exclude_from=self._source_exclude_files(idx),
+                    include_patterns=include_rules or None,
                     link_dest=link_dest,
                 )
                 total_files += result["files"]
@@ -305,14 +306,23 @@ class SnapshotMethod(RsyncMethod):
             return {"files_restored": 0, "bytes_restored": 0,
                     "errors": [f"Backup path not found: {src}"]}
 
-        result = self._rsync_one(
-            src,
-            target,
-            dry_run,
-            delete=False,
-            scroll_lines=scroll_lines,
+        # One live window for the restore run, with the target on the status line
+        window = LiveWindow(
+            scroll_lines,
             title=f"Restore output — {self.config.get('_name', '?')}",
         )
+        window.__enter__()
+        try:
+            window.set_context(str(target))
+            result = self._rsync_one(
+                src,
+                target,
+                dry_run,
+                delete=False,
+                window=window,
+            )
+        finally:
+            window.__exit__(None, None, None)
 
         return {
             "files_restored": result["files"],
@@ -348,9 +358,15 @@ class SnapshotMethod(RsyncMethod):
         }
 
         sources_status: list[dict[str, Any]] = []
-        for sp in source_paths:
+        for idx, sp in enumerate(source_paths):
             p = Path(sp).expanduser()
-            sources_status.append({"path": str(p), "exists": p.is_dir()})
+            includes, excludes = self._source_filter_files(idx)
+            sources_status.append({
+                "path": str(p),
+                "exists": p.is_dir(),
+                "include_files": includes,
+                "exclude_files": excludes,
+            })
         result["sources"] = sources_status
 
         snapshots = self._list_snapshots()

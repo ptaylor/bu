@@ -11,6 +11,9 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Self
 
+# ANSI CSI escape sequences (e.g. colours, cursor movement) stripped from rows.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
 
 class StreamResult:
     """Container for a streamed subprocess result."""
@@ -27,10 +30,14 @@ class LiveWindow:
     Keeps the last N lines of streamed output, redrawing them in place
     using ANSI cursor movement (clear-line + cursor-up).  Rows are
     colour-coded (errors red, warnings yellow, progress cyan, dirs blue).
-    A status line below the window shows the latest output row plus
-    elapsed time, repainted at most every ``status_interval`` seconds.
+    A status line below the window shows the elapsed time plus an
+    activity label set via ``set_context`` (e.g. the source path being
+    backed up), repainted at most every ``status_interval`` seconds.
     A yellow ``─`` dividing rule sits between the window rows and the
     status line, matching the title bar.
+    Rows are sanitised (ANSI escape codes stripped, backspaces emulated)
+    so tools like duplicity can't corrupt the display; the terminal width
+    is re-read on every repaint so a resize doesn't scramble the layout.
     Auto-disabled when stdout is not a TTY (plain passthrough).
     """
 
@@ -46,7 +53,7 @@ class LiveWindow:
         self.active = False
         self._lock = threading.Lock()
         self._buf: list[str] = []
-        self._status = ""
+        self._context = ""
         self._painted = 0
         self._width = 80
         self._start = 0.0
@@ -91,7 +98,12 @@ class LiveWindow:
             with self._lock:
                 if not self.active:
                     break
-                self._redraw()
+                try:
+                    self._redraw()
+                except OSError:
+                    # stdout went away (closed terminal) — stop repainting.
+                    self.active = False
+                    break
 
     def __exit__(self, *exc) -> bool:
         if not self.active:
@@ -122,13 +134,23 @@ class LiveWindow:
             return
         with self._lock:
             # Split on newlines AND carriage returns: progress bars update
-            # with \r, and each update becomes its own display row.
-            rows = [r for r in re.split(r"[\r\n]", text) if r]
+            # with \r, and each update becomes its own display row.  ANSI
+            # escape codes and backspaces are sanitised per row.
+            raw_rows = [r for r in re.split(r"[\r\n]", text) if r]
+            rows = [c for c in (self._clean_row(r) for r in raw_rows) if c]
             if rows:
                 self._buf.extend(rows)
                 if len(self._buf) > self.lines:
                     del self._buf[: len(self._buf) - self.lines]
-                self._status = self._buf[-1]
+                self._redraw()
+
+    def set_context(self, text: str) -> None:
+        """Set the status line's activity label (e.g. the source path)."""
+        with self._lock:
+            self._context = text
+            if self.active:
+                # Reset the throttle so the new context paints immediately.
+                self._last_status_paint = -1.0
                 self._redraw()
 
     @staticmethod
@@ -147,7 +169,32 @@ class LiveWindow:
             return f"\033[32m{row}\033[0m"          # green
         return row
 
+    @staticmethod
+    def _clean_row(row: str) -> str:
+        """Strip ANSI escape sequences and emulate backspace erasing.
+
+        duplicity's progress bars write ``\r`` + backspace re-draws; the
+        raw bytes would otherwise corrupt the window rows.
+        """
+        row = _ANSI_RE.sub("", row)
+        out: list[str] = []
+        for ch in row:
+            if ch == "\b":
+                if out:
+                    out.pop()
+            else:
+                out.append(ch)
+        return "".join(out).rstrip()
+
     def _redraw(self) -> None:
+        # Re-read the terminal width: a resize mid-run would otherwise
+        # scramble row truncation and the divider/status painting.
+        try:
+            self._width = shutil.get_terminal_size().columns
+        except OSError:
+            pass
+        if self._width < 20:
+            return
         # Move cursor up to the first output row of the window block.
         if self._painted:
             sys.stdout.write(f"\033[{self._painted + 1}A")
@@ -166,7 +213,7 @@ class LiveWindow:
         now = time.monotonic()
         if self._last_status_paint < 0 or now - self._last_status_paint >= self.status_interval:
             elapsed = now - self._start
-            status = f"[{int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}] {self._status}"
+            status = f"[{int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}] {self._context}"
             sys.stdout.write("\033[2K")
             sys.stdout.write(f"\033[1;36m{status[: self._width]}\033[0m")
             self._last_status_paint = now
@@ -180,6 +227,7 @@ def run_streaming(
     window: LiveWindow | None = None,
     title: str = "Live output",
     silence_stderr: bool = False,
+    silence_stdout: bool = False,
 ) -> StreamResult:
     """Run a command, streaming its output live to the terminal while capturing.
 
@@ -191,12 +239,15 @@ def run_streaming(
     If ``window`` is supplied, it is used instead of creating one — the
     caller owns its lifecycle (useful for sharing one window across
     several subprocess runs).  ``silence_stderr`` captures stderr without
-    writing it anywhere (the caller can re-emit condensed lines later).
+    writing it anywhere (the caller can re-emit condensed lines later);
+    ``silence_stdout`` does the same for stdout (the caller keeps it
+    captured, e.g. duplicity collection-status during ``bu status``).
     Return a StreamResult with combined output strings.
     """
     owns_window = window is None
     if window is None:
         window = LiveWindow(scroll_lines, title=title)
+    stdout_window = None if silence_stdout else window
     stderr_window = None if silence_stderr else window
     if owns_window:
         window.__enter__()
@@ -231,7 +282,7 @@ def run_streaming(
             finally:
                 stream.close()
 
-        t1 = threading.Thread(target=_tee, args=(proc.stdout, window, captured["stdout"]))
+        t1 = threading.Thread(target=_tee, args=(proc.stdout, stdout_window, captured["stdout"]))
         t2 = threading.Thread(target=_tee, args=(proc.stderr, stderr_window, captured["stderr"]))
         t1.start()
         t2.start()

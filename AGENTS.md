@@ -59,6 +59,16 @@ bu ACTION NAME [ARGS...]
   sources under `~/Library/...`; use `/Library`).
 - `_RESERVED_KEYS` in `src/bu/config.py` lists keys handled by the config layer;
   anything else flows through to the backend as `extra` config.
+- `source_paths` entries may be plain strings or tables with optional
+  per-source filter files:
+  `{ path = "/src", include = ["inc.txt"], exclude = ["exc.txt"] }`.
+  `include` lists paths relative to that source (only listed paths are
+  backed up, `.` = whole source); `exclude` is an rsync-style exclusion file
+  for that source (falls back to the destination-level exclude files when
+  omitted).  `DestinationConfig` parses them; backends receive
+  `_source_includes` and `_source_excludes` lists aligned with
+  `_source_paths`.  `src/bu/filters.py` has `read_filter_lines` and
+  `build_include_rules` (parent-chain `+` rules for rsync).
 - Generated configs (wizard and the `bu config NAME` sample template) must
   use multiline TOML lists:
 
@@ -83,7 +93,10 @@ bu ACTION NAME [ARGS...]
   `<destination>/<source basename>/` — there is NO destination-name subfolder.
 - Backup uses `rsync -a --delete` (exact mirror) plus `--stats`, and
   `--exclude-from=<file>` for each exclusion file that exists; restore never
-  uses `--delete` and excludes the status file.
+  uses `--delete` and excludes the status file.  Per-source include files
+  become `--include` rules followed by a trailing `--exclude=*`
+  (exclusion rules → include rules → skip everything else, so exclusions
+  win over includes).
 - Status file: `<destination>/bu-<NAME>-status.txt` (JSON content), written at
   backup start/end (`started`/`completed`/`error`). Dry-runs write nothing.
   The status file is NOT synced back on restore.
@@ -100,7 +113,8 @@ bu ACTION NAME [ARGS...]
   on the first backup or for sources added later.  rsync's default quick
   check compares size and mtime, so a file modified within the same second
   as the previous backup (same size) is treated as unchanged and
-  hard-linked (same caveat as rsnapshot).
+  hard-linked (same caveat as rsnapshot).  Per-source include/exclude
+  filter files work as with rsync (shared `_rsync_one`).
 - Hard-link support is verified by the `bu create` wizard and before the
   first backup: a random file in the destination is hard-linked to a second
   random name, the original deleted, and the content of the link checked.
@@ -121,7 +135,9 @@ bu ACTION NAME [ARGS...]
   (same layout rule as rsync; B2 URLs get `/subdir` appended).
 - Exclusion files are passed to duplicity as translated per-pattern
   `--include=<glob>` / `--exclude=<glob>` args (`translate_exclude_line` in
-  `duplicity.py`); only existing files are read.
+  `duplicity.py`); only existing files are read.  Per-source include files
+  become `--include=<source>/<path>` args with a closing `--exclude=**`
+  placed after the include args (exclusion args come first so they win).
 - Passphrase resolution order (never store it in the config):
   1. `passphrase_file` key — first line of the file (perms should be 0600)
   2. `BU_PASSPHRASE` / `PASSPHRASE` environment variable
@@ -143,7 +159,9 @@ bu ACTION NAME [ARGS...]
 - duplicity's stderr tracebacks are condensed to single-line errors
   (`condense_stderr` in `duplicity.py`): stderr is captured with
   `silence_stderr=True` and only condensed lines are re-emitted (live window,
-  result errors, and raw log).
+  result errors, and raw log).  `bu status` also captures collection-status
+  stdout silently (`silence_stdout=True` in `run_streaming`): the raw report
+  lands in `last_backup.output`, not on the terminal.
 
 ## Runtime state
 
@@ -165,9 +183,13 @@ bu ACTION NAME [ARGS...]
   The wizard always writes `exclude_files = [global, per-name]`; when neither
   file exists it creates both — `exclude.txt` pre-filled with common
   developer/editor patterns, `exclude-<name>.txt` empty — and tells the user
-  to review them.
+  to review them.  It also creates an empty `include-<name>.txt` and writes a
+  commented-out per-source include example
+  (`# source_paths = [{ path = ..., include = ... }]`) in the generated
+  config.
 - `src/bu/backends/base.py` — `Backend` ABC, `LiveWindow` (docker-style
-  redraw, title + yellow divider + throttled status line), `run_streaming`.
+  redraw, title + yellow divider + status line showing elapsed time and the
+  current source path via `set_context`), `run_streaming`.
 - `src/bu/backends/{local,duplicity}.py` — `RsyncMethod`, `DuplicityMethod`.
 - Backends receive `config["_name"]` and `config["_source_paths"]` internal keys.
 

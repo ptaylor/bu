@@ -96,6 +96,13 @@ _SAMPLE_GENERIC = """\
 #     "~/.config/bu/exclude.txt",
 #     "~/.config/bu/exclude-name.txt",
 # ]   # omitted: defaults to those two files (missing files are ignored)
+#
+# Per-source filter files (optional; inline tables must stay on one line):
+#   source_paths = [
+#       { path = "/path/to/backup", include = "~/.config/bu/include-name.txt", exclude = "~/.config/bu/exclude-name.txt" },
+#   ]
+#   include = ONLY these paths are backed up (relative to the source)
+#   exclude = rsync-style exclusion file for that source (falls back to exclude_files above)
 {history_file}
 {log_file}
 """
@@ -110,6 +117,13 @@ def _build_backend(dest: DestinationConfig) -> Any:
     config["_name"] = dest.name
     config["_source_paths"] = list(dest.source_paths)
     config["_exclude_files"] = [str(p) for p in dest.exclude_files]
+    config["_source_includes"] = [
+        [str(p) for p in lst] for lst in dest.per_source_include_files
+    ]
+    config["_source_excludes"] = [
+        None if lst is None else [str(p) for p in lst]
+        for lst in dest.per_source_exclude_files
+    ]
     return backend_cls(config)
 
 
@@ -577,6 +591,53 @@ def action_config(
             "errors": ["Missing required 'source_paths' key."],
         }
 
+    # Each entry is a path string or a table with per-source include/exclude.
+    for entry in source_paths:
+        if isinstance(entry, str):
+            continue
+        if not isinstance(entry, dict):
+            return {
+                "ok": False,
+                "name": name,
+                "created": created,
+                "file": str(file_path),
+                "errors": [
+                    "source_paths entries must be paths or tables with a 'path' key."
+                ],
+            }
+        if not isinstance(entry.get("path"), str) or not entry.get("path"):
+            return {
+                "ok": False,
+                "name": name,
+                "created": created,
+                "file": str(file_path),
+                "errors": ["source_paths table entries need a 'path' string."],
+            }
+        unknown = set(entry) - {"path", "include", "exclude"}
+        if unknown:
+            return {
+                "ok": False,
+                "name": name,
+                "created": created,
+                "file": str(file_path),
+                "errors": [
+                    (
+                        f"unknown source_paths entry key(s): {', '.join(sorted(unknown))} "
+                        "(allowed: path, include, exclude)."
+                    )
+                ],
+            }
+        for key in ("include", "exclude"):
+            value = entry.get(key)
+            if value is not None and not isinstance(value, str) and not isinstance(value, list):
+                return {
+                    "ok": False,
+                    "name": name,
+                    "created": created,
+                    "file": str(file_path),
+                    "errors": [f"{key!r} must be a string or a list of strings."],
+                }
+
     raw_dest = raw.get("destination", "")
     if not raw_dest:
         return {
@@ -820,6 +881,10 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
         for s in sources:
             icon = "✓" if s.get("exists") else "✗"
             lines.append(f"  {icon} {s.get('path', '?')}")
+            for label, key in (("include", "include_files"), ("exclude", "exclude_files")):
+                for f in s.get(key) or []:
+                    missing = "" if Path(f).expanduser().is_file() else " (missing)"
+                    lines.append(f"      {label}: {f}{missing}")
     else:
         # Fallback to flat list for JSON or older backends
         source_paths = result.get("source_paths", [])

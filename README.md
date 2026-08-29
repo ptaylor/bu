@@ -91,7 +91,7 @@ blocks. The destination filesystem must support hard links.
 | Key | Required | Description |
 |-----|----------|-------------|
 | `method` | Yes | `"rsync"`, `"duplicity"`, or `"snapshot"` |
-| `source_paths` | Yes | Array of directory paths to back up |
+| `source_paths` | Yes | Array of directory paths to back up; entries may also be tables with per-source `include`/`exclude` filter files (see below) |
 | `destination` | Yes | Base target directory, or a `b2://bucket/path` URL (duplicity only) |
 | `history_file` | No | Path to structured JSON-lines action history |
 | `log_file` | No | Path to raw execution log |
@@ -146,6 +146,27 @@ absolute paths, so they also match when a *parent* directory of the source
 has that name — e.g. bare `Library` excludes everything when the source
 itself lives under a `Library` folder. Use `/Library` to anchor the
 exclusion to the source root instead.
+
+### Include lists (optional)
+
+Instead of excluding what you *don't* want, a source can map to an include
+file that lists what you *do* want — everything else is skipped:
+
+```toml
+source_paths = [
+    { path = "/Users/paul", include = "~/.config/bu/include-paul.txt", exclude = "~/.config/bu/exclude-paul.txt" },
+]
+```
+
+- `include` — file listing paths relative to that source (one per line;
+  `#` comments and blank lines ignored). Only the listed paths are backed
+  up; a line of `.` backs up the whole source. A single file or a list.
+- `exclude` — rsync-style exclusion file for that source. When omitted, the
+  destination-level `exclude_files` defaults apply.
+- Per source, the filter order is: exclusion rules, then the includes, then
+  everything else is skipped — so exclusions win over includes. Removing a
+  line stops updating that path but never deletes the copy already in the
+  backup (excluded files are protected from `--delete`).
 
 ### Creating a config
 

@@ -4,7 +4,7 @@ Flow: backup type (DIR or B2) → destination (local directory for DIR, or
 B2 bucket/path plus credentials for B2) → method (rsync/duplicity/snapshot
 for DIR, duplicity-only for B2; snapshot destinations are checked for
 hard-link support) → source paths → duplicity-specific options →
-exclusion files (global + per-name).
+exclusion files (global + per-name, plus an empty per-name include list).
 Every answer is validated and re-prompted until it is correct.
 
 Choice menus are numbered and arrow-key scrollable when running on a TTY;
@@ -496,6 +496,18 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     extra["exclude_files"] = [str(global_excl), str(name_excl)]
     print(_paint("yellow", "  • Check and edit both exclusion files to match your needs"))
 
+    # Per-source include list — created empty; enable it to back up only
+    # the listed paths (a commented example is written into the config).
+    include_file = cfg_dir / f"include-{name}.txt"
+    if not include_file.exists():
+        include_file.write_text(
+            f"# Include list for {name!r} — paths relative to each source root.\n"
+            "# Only the listed paths are backed up; everything else is skipped.\n"
+        )
+        print(_paint("green", f"  ✓ Created {include_file.name} (empty)"))
+    else:
+        print(_paint("dim", f"  Using {include_file.name} (already exists)"))
+
     # ------------------------------------------------------------------
     # 10. Assemble and write the config
     # ------------------------------------------------------------------
@@ -508,6 +520,16 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     lines = [f"# {method} destination {name!r} — created by 'bu create'"]
     lines.append(f"method = {_toml_str(method)}")
     lines.append(f"source_paths = {_toml_str_list(sources)}")
+    if sources:
+        include_path = str(cfg_dir / f"include-{name}.txt")
+        example = (
+            f"#   source_paths = [{{ path = {_toml_str(sources[0])}, "
+            f"include = {_toml_str(include_path)} }}]"
+        )
+        lines.append(
+            "# Per-source include list (created empty — add paths relative to the source):"
+        )
+        lines.append(example)
     lines.append(f"destination = {_toml_str(dest)}")
     for key, value in extra.items():
         lines.append(f"{key} = {_toml_value(value)}")

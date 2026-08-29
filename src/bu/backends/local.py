@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
+from bu.filters import build_include_rules, read_filter_lines
 
 
 class RsyncMethod(Backend):
@@ -132,9 +133,6 @@ class RsyncMethod(Backend):
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
-        # Exclusion files that actually exist (missing ones are ignored).
-        exclude_from = self._existing_exclude_files()
-
         # One live window shared across all source runs
         window = LiveWindow(
             scroll_lines,
@@ -142,10 +140,17 @@ class RsyncMethod(Backend):
         )
         window.__enter__()
         try:
-            for src_str in source_paths:
+            for idx, src_str in enumerate(source_paths):
                 src = Path(src_str).expanduser().resolve()
+                window.set_context(str(src))
+                include_rules = self._source_include_rules(idx)
                 result = self._rsync_one(
-                    src, dest / src.name, dry_run, window=window, exclude_from=exclude_from,
+                    src,
+                    dest / src.name,
+                    dry_run,
+                    window=window,
+                    exclude_from=self._source_exclude_files(idx),
+                    include_patterns=include_rules or None,
                 )
                 total_files += result["files"]
                 total_bytes += result["bytes"]
@@ -222,15 +227,24 @@ class RsyncMethod(Backend):
             return {"files_restored": 0, "bytes_restored": 0,
                     "errors": [f"Backup path not found: {src}"]}
 
-        result = self._rsync_one(
-            src,
-            target,
-            dry_run,
-            delete=False,
-            scroll_lines=scroll_lines,
+        # One live window for the restore run, with the target on the status line
+        window = LiveWindow(
+            scroll_lines,
             title=f"Restore output — {self.config.get('_name', '?')}",
-            exclude=self._status_path().name,
         )
+        window.__enter__()
+        try:
+            window.set_context(str(target))
+            result = self._rsync_one(
+                src,
+                target,
+                dry_run,
+                delete=False,
+                window=window,
+                exclude=self._status_path().name,
+            )
+        finally:
+            window.__exit__(None, None, None)
 
         return {
             "files_restored": result["files"],
@@ -259,6 +273,43 @@ class RsyncMethod(Backend):
             if isinstance(p, str) and Path(p).is_file()
         ]
 
+    def _source_exclude_files(self, index: int) -> list[str]:
+        """Exclusion files for a source (per-source, else destination defaults)."""
+        per_source = self.config.get("_source_excludes", [])
+        if index < len(per_source) and per_source[index] is not None:
+            files = per_source[index]
+        else:
+            files = self.config.get("_exclude_files", [])
+        return [p for p in files if isinstance(p, str) and Path(p).is_file()]
+
+    def _source_filter_files(self, index: int) -> tuple[list[str], list[str]]:
+        """Return (include_files, exclude_files) as configured for a source.
+
+        A source with no per-source exclude shows the destination-level
+        ``_exclude_files`` defaults.
+        """
+        includes = self.config.get("_source_includes", [])
+        excludes = self.config.get("_source_excludes", [])
+        inc = list(includes[index]) if index < len(includes) else []
+        if index < len(excludes) and excludes[index] is not None:
+            exc = list(excludes[index])
+        else:
+            exc = list(self.config.get("_exclude_files", []))
+        return inc, exc
+
+    def _source_include_rules(self, index: int) -> list[str]:
+        """rsync include patterns for a source (empty when no include files)."""
+        per_source = self.config.get("_source_includes", [])
+        if index >= len(per_source):
+            return []
+        files = [p for p in per_source[index] if isinstance(p, str) and Path(p).is_file()]
+        if not files:
+            return []
+        lines: list[str] = []
+        for f in files:
+            lines.extend(read_filter_lines(Path(f)))
+        return build_include_rules(lines)
+
     def _rsync_one(
         self,
         src: Path,
@@ -271,6 +322,7 @@ class RsyncMethod(Backend):
         exclude: str | None = None,
         exclude_from: list[str] | None = None,
         link_dest: str | None = None,
+        include_patterns: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
@@ -279,7 +331,8 @@ class RsyncMethod(Backend):
         of restores); ``exclude_from`` lists exclusion files to pass via
         ``--exclude-from``; ``link_dest`` adds ``--link-dest=<dir>`` so
         unchanged files are hard-linked from a previous backup (snapshot
-        method).
+        method); ``include_patterns`` adds ``--include`` filter rules and
+        a trailing ``--exclude=*`` so only the listed paths are backed up.
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
@@ -298,6 +351,11 @@ class RsyncMethod(Backend):
             cmd.append(f"--exclude={exclude}")
         for ef in exclude_from or []:
             cmd.append(f"--exclude-from={ef}")
+        # Include rules come AFTER the exclusion files so exclusions win
+        # (first match wins), then a trailing --exclude=* skips the rest.
+        if include_patterns:
+            cmd.extend(f"--include={p}" for p in include_patterns)
+            cmd.append("--exclude=*")
         if dry_run:
             cmd.append("--dry-run")
         if link_dest:
@@ -364,13 +422,16 @@ class RsyncMethod(Backend):
             "dest_exists": dest_dir.is_dir(),
         }
 
-        # Check existence of each source path
+        # Check existence of each source path plus its filter files
         sources_status: list[dict[str, Any]] = []
-        for sp in source_paths:
+        for idx, sp in enumerate(source_paths):
             p = Path(sp).expanduser()
+            includes, excludes = self._source_filter_files(idx)
             sources_status.append({
                 "path": str(p),
                 "exists": p.is_dir(),
+                "include_files": includes,
+                "exclude_files": excludes,
             })
         result["sources"] = sources_status
 

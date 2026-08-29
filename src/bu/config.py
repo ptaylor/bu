@@ -44,6 +44,17 @@ class ConfigError(Exception):
     """Raised when configuration is invalid or missing."""
 
 
+def _normalise_file_list(value: Any, key: str) -> list[str] | None:
+    """Accept a string or a list of strings for per-source include/exclude."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return value
+    raise ConfigError(f"{key!r} must be a string or a list of strings")
+
+
 # Keys that are handled specially and NOT passed through to backend ``extra``.
 _RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file", "exclude_files"})
 
@@ -84,12 +95,40 @@ class DestinationConfig:
     def __init__(self, name: str, data: dict[str, Any], config_dir: Path | None = None) -> None:
         self.name = name
         self.method: str = data.get("method", "")
-        self.source_paths: list[str] = data.get("source_paths", [])
         self.destination: str = data.get("destination", "")
         self._config_dir = config_dir
         self._history_file_override: str | None = data.get("history_file")
         self._log_file_override: str | None = data.get("log_file")
         self._exclude_files_override: list[str] | None = data.get("exclude_files")
+
+        # source_paths entries are plain strings or tables with optional
+        # per-source ``include`` / ``exclude`` filter files.
+        self.source_paths: list[str] = []
+        self._per_source_includes: list[list[str]] = []
+        self._per_source_excludes: list[list[str] | None] = []
+        for entry in data.get("source_paths", []):
+            if isinstance(entry, str):
+                src, include, exclude = entry, None, None
+            elif isinstance(entry, dict):
+                src = entry.get("path", "")
+                if not isinstance(src, str) or not src:
+                    raise ConfigError("source_paths table entries need a 'path' string")
+                unknown = set(entry) - {"path", "include", "exclude"}
+                if unknown:
+                    raise ConfigError(
+                        f"unknown source_paths entry key(s): {', '.join(sorted(unknown))} "
+                        "(allowed: path, include, exclude)"
+                    )
+                include = _normalise_file_list(entry.get("include"), "include")
+                exclude = _normalise_file_list(entry.get("exclude"), "exclude")
+            else:
+                raise ConfigError(
+                    "source_paths entries must be paths or tables with a 'path' key"
+                )
+            self.source_paths.append(src)
+            self._per_source_includes.append(include or [])
+            self._per_source_excludes.append(exclude)
+
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
             if k not in _RESERVED_KEYS
@@ -130,6 +169,19 @@ class DestinationConfig:
         return [
             cfg_dir / "exclude.txt",
             cfg_dir / f"exclude-{self.name}.txt",
+        ]
+
+    @property
+    def per_source_include_files(self) -> list[list[Path]]:
+        """Include-list files per source (empty list = no include filtering)."""
+        return [[Path(p).expanduser() for p in lst] for lst in self._per_source_includes]
+
+    @property
+    def per_source_exclude_files(self) -> list[list[Path] | None]:
+        """Exclusion files per source (None = use destination-level defaults)."""
+        return [
+            None if lst is None else [Path(p).expanduser() for p in lst]
+            for lst in self._per_source_excludes
         ]
 
     def __repr__(self) -> str:
@@ -206,7 +258,12 @@ class Config:
                 errors.append(f"{fp.name}: missing required 'destination' path")
                 continue
 
-            self.destinations[name] = DestinationConfig(name, data, config_dir=self.config_dir)
+            try:
+                self.destinations[name] = DestinationConfig(
+                    name, data, config_dir=self.config_dir
+                )
+            except ConfigError as e:
+                errors.append(f"{fp.name}: {e}")
 
         if errors:
             raise ConfigError("\n".join(errors))

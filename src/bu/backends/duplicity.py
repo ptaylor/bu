@@ -32,6 +32,7 @@ from urllib.parse import quote
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
 from bu.crypto import CryptoError, decrypt_secret
+from bu.filters import read_filter_lines
 
 
 def translate_exclude_line(line: str) -> tuple[bool, str] | None:
@@ -315,7 +316,55 @@ class DuplicityMethod(Backend):
             ]
         return {"BACKEND_PASSWORD": creds[1]}, []
 
-    def _exclude_args(self, source: Path) -> list[str]:
+    def _source_exclude_files(self, index: int) -> list[str]:
+        """Exclusion files for a source (per-source, else destination defaults)."""
+        per_source = self.config.get("_source_excludes", [])
+        if index < len(per_source) and per_source[index] is not None:
+            files = per_source[index]
+        else:
+            files = self.config.get("_exclude_files", [])
+        return [p for p in files if isinstance(p, str) and Path(p).is_file()]
+
+    def _source_filter_files(self, index: int) -> tuple[list[str], list[str]]:
+        """Return (include_files, exclude_files) as configured for a source.
+
+        A source with no per-source exclude shows the destination-level
+        ``_exclude_files`` defaults.
+        """
+        includes = self.config.get("_source_includes", [])
+        excludes = self.config.get("_source_excludes", [])
+        inc = list(includes[index]) if index < len(includes) else []
+        if index < len(excludes) and excludes[index] is not None:
+            exc = list(excludes[index])
+        else:
+            exc = list(self.config.get("_exclude_files", []))
+        return inc, exc
+
+    def _include_args(self, source: Path, index: int) -> tuple[list[str], list[str]]:
+        """duplicity include args for a source plus the closing ``--exclude=**``.
+
+        Include lines are paths relative to the source root, anchored to
+        the resolved source path.  Returns ``(prefix_args, closing_args)``
+        — the closing exclude goes after the translated exclusion args so
+        only listed paths remain.
+        """
+        per_source = self.config.get("_source_includes", [])
+        if index >= len(per_source):
+            return [], []
+        files = [p for p in per_source[index] if isinstance(p, str) and Path(p).is_file()]
+        if not files:
+            return [], []
+        lines: list[str] = []
+        for f in files:
+            lines.extend(read_filter_lines(Path(f)))
+        if not lines or any(ln in (".", "/") for ln in lines):
+            return [], []
+        prefix = [
+            f"--include={source}/{ln.strip('/')}" for ln in lines if ln.strip("/")
+        ]
+        return prefix, ["--exclude=**"]
+
+    def _exclude_args(self, source: Path, exclude_files: list[str]) -> list[str]:
         """Build duplicity include/exclude args from rsync-style exclusion files.
 
         Each line is translated to a glob (duplicity 3.x raises
@@ -327,7 +376,7 @@ class DuplicityMethod(Backend):
         through unchanged.  Missing files are skipped.
         """
         args: list[str] = []
-        for path in self.config.get("_exclude_files", []):
+        for path in exclude_files:
             if not isinstance(path, str):
                 continue
             p = Path(path)
@@ -357,6 +406,7 @@ class DuplicityMethod(Backend):
         window: LiveWindow | None = None,
         title: str = "Live output",
         extra_env: dict[str, str] | None = None,
+        silence_stdout: bool = False,
     ) -> dict[str, Any]:
         """Run the duplicity CLI.  Returns ``{files, bytes, errors, stdout, stderr}``."""
         env = dict(os.environ)
@@ -373,7 +423,7 @@ class DuplicityMethod(Backend):
             # condensed into single-line errors and re-emitted below.
             proc = run_streaming(
                 cmd, env=env, scroll_lines=scroll_lines, window=window,
-                title=title, silence_stderr=True,
+                title=title, silence_stderr=True, silence_stdout=silence_stdout,
             )
         except FileNotFoundError:
             return {"files": 0, "bytes": 0,
@@ -513,9 +563,10 @@ class DuplicityMethod(Backend):
                     n += 1
                 used_subdirs.add(candidate)
 
-                # Exclusions translated per source: leading-`/` patterns are
-                # anchored to this source's root (missing files are ignored).
-                exclude_args = self._exclude_args(src)
+                # Per-source filter files: exclusion rules first (so they win),
+                # then include rules, then the closing --exclude=**.
+                include_args, include_close = self._include_args(src, idx)
+                exclude_args = self._exclude_args(src, self._source_exclude_files(idx))
 
                 args: list[str] = []
                 if cadence := self.config.get("full_if_older_than"):
@@ -526,9 +577,12 @@ class DuplicityMethod(Backend):
                 if dry_run:
                     args.append("--dry-run")
                 args.extend(exclude_args)
+                args.extend(include_args)
+                args.extend(include_close)
                 args.append(str(src))
                 args.append(self._target_url(candidate))
 
+                window.set_context(str(src))
                 result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
                 total_files += result["files"]
                 total_bytes += result["bytes"]
@@ -646,6 +700,7 @@ class DuplicityMethod(Backend):
                 args.append(self._target_url(subdir))
                 args.append(str(dest_dir))
 
+                window.set_context(str(dest_dir))
                 result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
                 total_files += result["files"]
                 total_bytes += result["bytes"]
@@ -694,11 +749,17 @@ class DuplicityMethod(Backend):
                 "dest_exists": base.is_dir(),
             }
 
-        # Source existence checks
+        # Source existence checks plus per-source filter files
         sources_status: list[dict[str, Any]] = []
-        for sp in source_paths:
+        for idx, sp in enumerate(source_paths):
             p = Path(sp).expanduser()
-            sources_status.append({"path": str(p), "exists": p.is_dir()})
+            includes, excludes = self._source_filter_files(idx)
+            sources_status.append({
+                "path": str(p),
+                "exists": p.is_dir(),
+                "include_files": includes,
+                "exclude_files": excludes,
+            })
         result["sources"] = sources_status
 
         # Passphrase availability (file/env only — status never prompts)
@@ -740,6 +801,7 @@ class DuplicityMethod(Backend):
                         ["collection-status", self._target_url(subdir, account_id=b2_aid)],
                         passphrase,
                         extra_env=b2_env,
+                        silence_stdout=True,
                     )
                     combined_output.append(f"--- {subdir} ---")
                     combined_output.append(r.get("stdout", "").strip())
@@ -764,6 +826,7 @@ class DuplicityMethod(Backend):
             for subdir in archives:
                 r = self._run_duplicity(
                     ["collection-status", self._target_url(subdir)], passphrase,
+                    silence_stdout=True,
                 )
                 combined_output.append(f"--- {subdir} ---")
                 combined_output.append(r.get("stdout", "").strip())
