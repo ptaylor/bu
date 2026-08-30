@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -102,12 +103,77 @@ class SnapshotMethod(RsyncMethod):
             if p.is_dir() and self.SNAPSHOT_RE.match(p.name)
         )
 
-    def _latest_snapshot_with(self, subdir: str) -> Path | None:
-        """Return the newest snapshot containing ``subdir``, if any."""
+    def _latest_snapshot_with(self, subdir: str, exclude: Path | None = None) -> Path | None:
+        """Return the newest snapshot containing ``subdir``, if any.
+
+        ``exclude`` skips a snapshot dir (used when resuming a failed run
+        so the in-progress dir is never its own ``--link-dest`` base).
+        """
         for snap in reversed(self._list_snapshots()):
+            if snap == exclude:
+                continue
             if (snap / subdir).is_dir():
                 return snap
         return None
+
+    def _resume_snapshot(self) -> str | None:
+        """Return the timestamp of an interrupted run, if recoverable.
+
+        Prefers the ``snapshot`` key from the status file; older status
+        files (written before that key existed) may lack it, in which case
+        the newest snapshot directory is assumed to be the interrupted one.
+        """
+        sp = self._status_path()
+        if sp.exists():
+            try:
+                data = json.loads(sp.read_text())
+            except (json.JSONDecodeError, OSError):
+                data = {}
+            ts = data.get("snapshot")
+            if isinstance(ts, str) and self.SNAPSHOT_RE.match(ts):
+                return ts
+        snaps = self._list_snapshots()
+        return snaps[-1].name if snaps else None
+
+    def incomplete_snapshot_info(self) -> dict[str, Any] | None:
+        """Return the removable incomplete snapshot, or None.
+
+        Only a non-``completed`` run with a ``snapshot`` timestamp whose
+        directory still exists is removable (completed snapshots are never
+        offered for removal by this helper).
+        """
+        sp = self._status_path()
+        if not sp.exists():
+            return None
+        try:
+            data = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+        if data.get("state") == "completed":
+            return None
+        ts = data.get("snapshot")
+        if not isinstance(ts, str) or not self.SNAPSHOT_RE.match(ts):
+            return None
+        snap_dir = self._dest_dir() / ts
+        if not snap_dir.is_dir():
+            return None
+        return {"snapshot": ts, "dir": str(snap_dir)}
+
+    def remove_incomplete_snapshot(self) -> dict[str, Any]:
+        """Delete the incomplete snapshot directory and reset the status.
+
+        Only the single timestamped directory is removed — older snapshots
+        are never touched.  Returns an ok/errors result.
+        """
+        info = self.incomplete_snapshot_info()
+        if info is None:
+            return {"ok": False, "errors": ["No incomplete snapshot backup found"]}
+        try:
+            shutil.rmtree(Path(info["dir"]))
+        except OSError as e:
+            return {"ok": False, "errors": [f"Cannot remove {info['dir']}: {e}"]}
+        self.reset_status()
+        return {"ok": True, "removed": info["dir"], "snapshot": info["snapshot"]}
 
     # ------------------------------------------------------------------
     # hard-link support check
@@ -150,6 +216,13 @@ class SnapshotMethod(RsyncMethod):
         is passed as ``--link-dest``; unchanged files are hard-linked
         rather than copied.  Dry runs create nothing.
         """
+        resume: str | None = None
+        if extra_args and extra_args.get("restart"):
+            # backup-restart: remember the failed run's timestamp before
+            # clearing the status, then continue into the SAME directory.
+            resume = self._resume_snapshot()
+            self.reset_status()
+
         errors = self._validate_sources_are_dirs(source_paths)
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}
@@ -158,17 +231,22 @@ class SnapshotMethod(RsyncMethod):
         if dest_errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": dest_errors}
 
+        ts = self._timestamp_name()
+        if resume and (self._dest_dir() / resume).is_dir():
+            # Continue into the same timestamped directory the failed run
+            # was filling; a missing dir falls back to a fresh timestamp.
+            ts = resume
+        snap_dir = self._dest_dir() / ts
+
         if not dry_run:
             if self._hardlink_check_needed():
                 link_errors = self._check_hardlink_support()
                 if link_errors:
                     return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0,
                             "errors": link_errors}
-            self._write_status("started")
-
-        ts = self._timestamp_name()
-        snap_dir = self._dest_dir() / ts
-        if not dry_run:
+            # Record the snapshot timestamp from the very start so an
+            # interrupted run can be resumed into the SAME directory.
+            self._write_status("started", snapshot=ts)
             snap_dir.mkdir(parents=True, exist_ok=True)
 
         total_files = 0
@@ -198,9 +276,10 @@ class SnapshotMethod(RsyncMethod):
                 used_subdirs.add(candidate)
 
                 # Hard-link unchanged files from the newest snapshot that
-                # already holds this source's subdirectory.
+                # already holds this source's subdirectory (never the
+                # in-progress dir itself when resuming).
                 link_dest = None
-                if latest := self._latest_snapshot_with(candidate):
+                if latest := self._latest_snapshot_with(candidate, exclude=snap_dir):
                     link_dest = str(latest / candidate)
 
                 window.set_context(str(src))

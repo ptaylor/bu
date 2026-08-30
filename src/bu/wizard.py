@@ -280,9 +280,9 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     prompted for.  Returns a summary dict.  Raises EOFError/KeyboardInterrupt
     if aborted.
     """
-    cfg = Config(config_dir)
+    cfg = Config(config_dir, strict=False)
     cfg_dir = cfg.config_dir
-    existing = set(cfg.list_destinations())
+    existing = set(cfg.list_destinations()) | set(cfg.errors)
 
     print(_paint("bold", "Create a new backup destination"))
     print(_paint("dim", "Ctrl-C aborts at any time."))
@@ -537,7 +537,7 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     lines.append(f"log_file = {_toml_str(log_path)}")
     file_path.write_text("\n".join(lines) + "\n")
 
-    dest_cfg = Config(cfg_dir).get(name)
+    dest_cfg = Config(cfg_dir, strict=False).get(name)
 
     return {
         "ok": True,

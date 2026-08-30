@@ -5,6 +5,8 @@ Usage:
 
 Actions:
     backup    Back up source paths to the destination
+    backup-restart  Reset a failed/ongoing backup's status and start again
+    backup-remove   Remove an incomplete snapshot backup directory
     restore   Restore files into a local directory (never deletes)
     status    Show status and last backup details
     list      List all configured destinations
@@ -26,6 +28,8 @@ import click
 
 from bu.actions import (
     action_backup,
+    action_backup_remove,
+    action_backup_remove_confirmed,
     action_config,
     action_history,
     action_log,
@@ -56,9 +60,13 @@ def _command(name: str | None = None, **kwargs: Any) -> Any:
 
 
 def _load_config() -> Config:
-    """Load configuration, printing a friendly error and exiting on failure."""
+    """Load configuration, printing a friendly error and exiting on failure.
+
+    Invalid .toml files are tolerated — their errors surface per-name via
+    ``Config.get`` — so one broken file doesn't block every command.
+    """
     try:
-        return Config()
+        return Config(strict=False)
     except ConfigError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -95,12 +103,18 @@ def main(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
         # Also list configured destinations
         try:
-            cfg = Config()
+            cfg = Config(strict=False)
             dests = cfg.list_destinations()
             if dests:
                 click.echo(f"\nConfigured destinations: {', '.join(dests)}")
             else:
                 click.echo("\nNo destinations configured. Run 'bu create' to configure one.")
+            if cfg.errors:
+                click.echo(
+                    f"\nWarning: invalid config file(s): {', '.join(cfg.errors)}. "
+                    "Run 'bu list' for details, 'bu config NAME' to fix, "
+                    "or 'bu delete NAME' to remove."
+                )
         except ConfigError:
             click.echo("\nNo config directory found. Run 'bu create' to get started.")
 
@@ -117,6 +131,67 @@ def backup(name: str) -> None:
     # Exit non-zero if there were errors
     if result.get("errors"):
         sys.exit(1)
+
+
+@_command("backup-restart")
+@_NAME_ARG
+def backup_restart(name: str) -> None:
+    """Reset the status of a failed/ongoing backup for NAME and start again.
+
+    For rsync and duplicity the backup simply runs fresh.  For snapshot,
+    the run continues into the SAME timestamped snapshot directory it was
+    interrupted in, hard-linking from the previous snapshot as before.
+    Refuses to run when the previous backup completed.
+    """
+    dest_cfg = _resolve_destination(name)
+
+    result = action_backup(
+        dest_cfg,
+        extra_args={"restart": True},
+        scroll_lines=_default_window(),
+    )
+    click.echo(format_result(result))
+
+    if result.get("errors"):
+        sys.exit(1)
+
+
+@_command("backup-remove")
+@_NAME_ARG
+def backup_remove(name: str) -> None:
+    """Remove the incomplete snapshot backup directory for NAME (snapshot only).
+
+    Deletes only the interrupted snapshot's timestamped directory (after
+    confirmation) and resets the status so the next backup starts fresh.
+    """
+    dest_cfg = _resolve_destination(name)
+
+    info = action_backup_remove(dest_cfg)
+    if not info.get("ok"):
+        click.echo(f"Error: {info.get('errors', ['unknown error'])[0]}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        "Warning: this deletes the incomplete snapshot directory only — "
+        "older snapshots are kept."
+    )
+    click.echo(f"  {info['dir']}")
+    try:
+        confirmed = click.confirm("Remove this snapshot directory?", default=False)
+    except click.exceptions.Abort:
+        click.echo("Aborted.")
+        sys.exit(1)
+    if not confirmed:
+        click.echo("Aborted.")
+        sys.exit(1)
+
+    result = action_backup_remove_confirmed(dest_cfg)
+    if not result.get("ok"):
+        click.echo(f"Error: {result.get('errors', ['unknown error'])[0]}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Removed: {result['removed']}")
+    click.echo("Status reset — 'bu backup' will start a fresh snapshot.")
 
 
 @_command()
@@ -166,30 +241,31 @@ def list_destinations() -> None:
     Shows every destination (backup config) with its method and target.
     """
     try:
-        cfg = Config()
-        dests = cfg.list_destinations()
+        cfg = Config(strict=False)
     except ConfigError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
-    rows: list[dict[str, str]] = []
-    for name in dests:
-        try:
-            d = cfg.get(name)
-            rows.append({"name": name, "method": d.method, "destination": d.destination})
-        except ConfigError as e:
-            rows.append({"name": name, "method": "invalid", "destination": "", "error": str(e)})
-
-    if not rows:
+    names = sorted(set(cfg.destinations) | set(cfg.errors))
+    if not names:
         click.echo("No destinations configured.")
         click.echo("Run 'bu create' to configure one.")
         return
 
-    for r in rows:
-        if r.get("error"):
-            click.echo(f"{r['name']:<24} <invalid config: {r['error']}>")
+    for name in names:
+        if name in cfg.errors:
+            click.echo(f"{name:<24} <invalid config: {cfg.errors[name]}>")
         else:
-            click.echo(f"{r['name']:<24} {r['method']:<10} {r['destination']}")
+            d = cfg.destinations[name]
+            click.echo(f"{name:<24} {d.method:<10} {d.destination}")
+
+    if cfg.errors:
+        click.echo(
+            f"\nError: {len(cfg.errors)} invalid config file(s). "
+            "Fix with 'bu config NAME' or remove with 'bu delete NAME'.",
+            err=True,
+        )
+        sys.exit(1)
 
 
 @_command()
@@ -227,7 +303,8 @@ def delete(name: str) -> None:
 
     file_path = cfg.config_dir / f"{name}.toml"
     if not file_path.exists():
-        available = ", ".join(cfg.list_destinations()) or "(none)"
+        names = sorted(set(cfg.list_destinations()) | set(cfg.errors))
+        available = ", ".join(names) or "(none)"
         click.echo(
             f"Error: No config found for {name!r}. "
             f"Available destinations: {available}",

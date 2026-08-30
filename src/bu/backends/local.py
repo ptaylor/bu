@@ -113,6 +113,10 @@ class RsyncMethod(Backend):
         Output streams live; with ``scroll_lines`` > 0 it is confined to a
         fixed-height terminal window.
         """
+        if extra_args and extra_args.get("restart"):
+            # backup-restart: clear the failed/started state and run again.
+            self.reset_status()
+
         errors = self._validate_sources_are_dirs(source_paths)
         if errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": errors}

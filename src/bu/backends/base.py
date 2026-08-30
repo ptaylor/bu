@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -308,6 +309,53 @@ class Backend(ABC):
         Internal keys ``_name`` and ``_source_paths`` are also provided.
         """
         self.config = config
+
+    def backup_block_reason(self) -> str | None:
+        """Return why a new backup is blocked, or None to proceed.
+
+        The status file records the last run; only a ``completed`` state
+        (or no status file at all) allows a new backup, so an ongoing or
+        failed run is never silently overwritten.
+        """
+        name = self.config.get("_name", "unknown")
+        sp = self._status_path()
+        if not sp.exists():
+            return None
+        try:
+            data = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        state = data.get("state")
+        if state == "completed":
+            return None
+        if state == "started":
+            return f"Backup for {name!r} appears to still be running (state 'started')."
+        return f"Previous backup for {name!r} did not complete (state {state or 'unknown'!r})."
+
+    def restart_block_reason(self) -> str | None:
+        """Return why backup-restart should be refused, or None to proceed.
+
+        Restart only makes sense while a previous run is 'started' or
+        'error'; a completed or missing status has nothing to recover.
+        """
+        name = self.config.get("_name", "unknown")
+        sp = self._status_path()
+        if not sp.exists():
+            return (
+                f"No previous backup state to restart for {name!r} — "
+                f"run 'bu backup {name}' instead."
+            )
+        try:
+            data = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        if data.get("state") == "completed":
+            return f"Backup for {name!r} already completed — nothing to restart."
+        return None
+
+    def reset_status(self) -> None:
+        """Delete the status file so the next backup starts unblocked."""
+        self._status_path().unlink(missing_ok=True)
 
     @abstractmethod
     def backup(

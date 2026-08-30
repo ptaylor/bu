@@ -11,8 +11,9 @@ or Backblaze B2).
 bu ACTION NAME [ARGS...]
 ```
 
-- `ACTION` is one of: `backup`, `restore`, `status`, `list`, `config`,
-  `delete`, `history`, `log`, `encrypt`, `create`, `help`.
+- `ACTION` is one of: `backup`, `backup-restart`, `backup-remove`, `restore`,
+  `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`,
+  `create`, `help`.
 - `NAME` is a named destination that exists as a `.toml` config file
   (except `list`, `encrypt`, `create`, and bare `config`, which take no
   name).
@@ -26,6 +27,15 @@ bu ACTION NAME [ARGS...]
 - `bu restore NAME RESTORE_DIR [PATH]` — `PATH` is a path within the backup;
   its files are restored into `RESTORE_DIR/<final path component>`
   (e.g. path `x/y` → `RESTORE_DIR/y`). Restore NEVER deletes files.
+- `bu backup` refuses to run while the destination status file is not
+  `completed` (prevents concurrent runs and silently overwriting a failed
+  one).  `bu backup-restart NAME` resets the status and runs again — for
+  snapshot it resumes the SAME timestamp dir recorded in the status file
+  (that dir is excluded from `--link-dest` selection).  `bu backup-remove
+  NAME` (snapshot only, always confirms) deletes the incomplete snapshot
+  dir and resets the status.  Both refuse to run when the status is
+  `completed` (nothing to recover).  `bu restore` refuses while the status
+  is not `completed`.  `bu status` prints the remediation hints.
 - `bu delete NAME` removes ONLY the config file (always prompts for
   confirmation). It must always warn that backup contents are not deleted.
 
@@ -59,6 +69,11 @@ bu ACTION NAME [ARGS...]
   sources under `~/Library/...`; use `/Library`).
 - `_RESERVED_KEYS` in `src/bu/config.py` lists keys handled by the config layer;
   anything else flows through to the backend as `extra` config.
+- `Config(strict=True)` (default) raises if any `.toml` file is invalid;
+  `strict=False` collects per-file errors in `cfg.errors` (name → message) and
+  `Config.get(name)` raises that specific error.  `bu list` uses lenient mode
+  (shows invalid files, exits 1), and `bu delete`/`bu config NAME` can still
+  fix or remove broken files.
 - `source_paths` entries may be plain strings or tables with optional
   per-source filter files:
   `{ path = "/src", include = ["inc.txt"], exclude = ["exc.txt"] }`.
@@ -121,10 +136,11 @@ bu ACTION NAME [ARGS...]
   Later backups skip the check when `bu-<NAME>-status.txt` already records
   method `snapshot`.  Failure aborts with an error (FAT/exFAT/SMB targets).
 - Status file: `<destination>/bu-<NAME>-status.txt` (same as rsync) with a
-  `snapshot` key holding the timestamp.  Restore defaults to the latest
-  snapshot; a PATH whose first component is a timestamp selects that
-  snapshot.  Restore never deletes.
-- `bu status` lists the snapshot count and the newest snapshots.
+  `snapshot` key holding the timestamp, recorded from the very first
+  `started` write so `bu backup-restart` can resume the SAME directory.
+  Restore defaults to the latest snapshot; a PATH whose first component is
+  a timestamp selects that snapshot.  Restore never deletes.
+- `bu status` lists ALL snapshots (oldest→newest, latest marked).
 
 ### duplicity (`src/bu/backends/duplicity.py`)
 

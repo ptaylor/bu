@@ -311,10 +311,18 @@ def test_format_status_lists_snapshots() -> None:
         "sources": [],
         "dest_path": "/mnt/backup",
         "dest_exists": True,
-        "snapshot_count": 2,
-        "snapshots": ["2026-08-15-21.09.41", "2026-08-16-10.00.00"],
-        "latest_snapshot": "2026-08-16-10.00.00",
+        "snapshot_count": 5,
+        "snapshots": [
+            "2026-08-11-00.00.00",
+            "2026-08-12-00.00.00",
+            "2026-08-13-00.00.00",
+            "2026-08-14-00.00.00",
+            "2026-08-15-00.00.00",
+        ],
+        "latest_snapshot": "2026-08-15-00.00.00",
         "last_backup": None,
     })
-    assert "Snapshots    : 2" in out
-    assert "2026-08-16-10.00.00 ← latest" in out
+    assert "Snapshots    : 5" in out
+    assert "2026-08-15-00.00.00 ← latest" in out
+    # ALL snapshots are listed — the count must match the listing.
+    assert "2026-08-11-00.00.00" in out

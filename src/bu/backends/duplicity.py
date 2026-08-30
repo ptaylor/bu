@@ -498,6 +498,10 @@ class DuplicityMethod(Backend):
     ) -> dict[str, Any]:
         errors: list[str] = []
 
+        if extra_args and extra_args.get("restart"):
+            # backup-restart: clear the failed/started state and run again.
+            self.reset_status()
+
         # Validate sources are directories
         for sp in source_paths:
             p = Path(sp).expanduser()

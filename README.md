@@ -19,8 +19,10 @@ Commands take positional arguments only — no flags to remember. Use `bu help`
 
 | Command | Description |
 |---------|-------------|
-| `bu backup NAME` | Back up source directories to the destination (rsync or duplicity) |
-| `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes) |
+| `bu backup NAME` | Back up source directories to the destination (rsync, snapshot, or duplicity). Refuses to run while the previous run is not `completed` |
+| `bu backup-restart NAME` | Reset a failed/ongoing backup's status and start again; refuses when the last run completed (snapshot resumes the same timestamped directory) |
+| `bu backup-remove NAME` | Remove an incomplete snapshot directory (snapshot only; refuses when the last run completed; asks for confirmation) |
+| `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes; refuses while the last backup is not `completed`) |
 | `bu status NAME` | Show config, destination state, and last backup details |
 | `bu list` | List all configured destinations |
 | `bu config [NAME]` | Edit (or create) a destination config in `$EDITOR` |
@@ -79,7 +81,10 @@ Each backup creates a new `destination/<UTC timestamp>/` (e.g.
 `2026-08-15-21.09.41`) holding every source in its own subdirectory.
 Unchanged files are hard-linked to the previous snapshot via
 `rsync --link-dest`, so many timestamped backups share the same disk
-blocks. The destination filesystem must support hard links.
+blocks. The destination filesystem must support hard links. An interrupted
+snapshot backup is recoverable: `bu backup-restart` resumes into the SAME
+timestamped directory, or `bu backup-remove` discards it (after
+confirmation).
 
 > rsync decides whether a file is unchanged by size and modification time.
 > A file changed within the same second as the previous backup — to the

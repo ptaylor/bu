@@ -195,9 +195,13 @@ class Config:
     The filename (minus .toml) is the destination name.
     """
 
-    def __init__(self, config_dir: Path | None = None) -> None:
+    def __init__(
+        self, config_dir: Path | None = None, *, strict: bool = True
+    ) -> None:
         self.config_dir = config_dir or self._default_dir()
         self.destinations: dict[str, DestinationConfig] = {}
+        self.errors: dict[str, str] = {}
+        self._strict = strict
 
         if self.config_dir.exists():
             self._load()
@@ -222,40 +226,45 @@ class Config:
         if not toml_files:
             return  # No destinations configured yet — not an error
 
-        errors: list[str] = []
         for fp in toml_files:
             name = fp.stem  # filename without .toml
             try:
                 with open(fp, "rb") as f:
                     data = tomllib.load(f)
             except tomllib.TOMLDecodeError as e:
-                errors.append(f"{fp.name}: invalid TOML — {e}")
+                self.errors[name] = f"{fp.name}: invalid TOML — {e}"
                 continue
             except OSError as e:
-                errors.append(f"{fp.name}: cannot read — {e}")
+                self.errors[name] = f"{fp.name}: cannot read — {e}"
                 continue
 
             if not isinstance(data, dict):
-                errors.append(f"{fp.name}: must contain key-value pairs")
+                self.errors[name] = f"{fp.name}: must contain key-value pairs"
                 continue
 
             method = data.get("method", "")
             if not method:
-                errors.append(f"{fp.name}: missing required 'method' key (must be 'rsync', 'duplicity' or 'snapshot')")
+                self.errors[name] = (
+                    f"{fp.name}: missing required 'method' key "
+                    "(must be 'rsync', 'duplicity' or 'snapshot')"
+                )
                 continue
 
             if method not in _VALID_METHODS:
-                errors.append(f"{fp.name}: unknown method {method!r} — must be 'rsync', 'duplicity' or 'snapshot'")
+                self.errors[name] = (
+                    f"{fp.name}: unknown method {method!r} — "
+                    "must be 'rsync', 'duplicity' or 'snapshot'"
+                )
                 continue
 
             source_paths = data.get("source_paths", [])
             if not source_paths:
-                errors.append(f"{fp.name}: missing required 'source_paths'")
+                self.errors[name] = f"{fp.name}: missing required 'source_paths'"
                 continue
 
             destination = data.get("destination", "")
             if not destination:
-                errors.append(f"{fp.name}: missing required 'destination' path")
+                self.errors[name] = f"{fp.name}: missing required 'destination' path"
                 continue
 
             try:
@@ -263,10 +272,10 @@ class Config:
                     name, data, config_dir=self.config_dir
                 )
             except ConfigError as e:
-                errors.append(f"{fp.name}: {e}")
+                self.errors[name] = f"{fp.name}: {e}"
 
-        if errors:
-            raise ConfigError("\n".join(errors))
+        if self.errors and self._strict:
+            raise ConfigError("\n".join(self.errors.values()))
 
     def get(self, name: str) -> DestinationConfig:
         """Return configuration for a named destination.
@@ -278,6 +287,8 @@ class Config:
                 f"Invalid destination name {name!r} — names may only contain "
                 "letters, digits, '-' and '_'."
             )
+        if name in self.errors:
+            raise ConfigError(self.errors[name])
         if name not in self.destinations:
             available = ", ".join(sorted(self.destinations.keys())) or "(none)"
             raise ConfigError(

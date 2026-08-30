@@ -99,7 +99,7 @@ _SAMPLE_GENERIC = """\
 #
 # Per-source filter files (optional; inline tables must stay on one line):
 #   source_paths = [
-#       { path = "/path/to/backup", include = "~/.config/bu/include-name.txt", exclude = "~/.config/bu/exclude-name.txt" },
+#       {{ path = "/path/to/backup", include = "~/.config/bu/include-name.txt", exclude = "~/.config/bu/exclude-name.txt" }},
 #   ]
 #   include = ONLY these paths are backed up (relative to the source)
 #   exclude = rsync-style exclusion file for that source (falls back to exclude_files above)
@@ -239,6 +239,35 @@ def action_backup(
     scroll_lines: int = 0,
 ) -> dict[str, Any]:
     """Run a backup to the configured destination."""
+    backend = _build_backend(dest)
+
+    # A status file that isn't 'completed' blocks new backups: an ongoing
+    # or failed run must be resolved first (backup-restart / backup-remove).
+    restart = (extra_args or {}).get("restart")
+    if restart and (reason := backend.restart_block_reason()):
+        return {
+            "files_copied": 0,
+            "files_skipped": 0,
+            "bytes_copied": 0,
+            "errors": [reason],
+        }
+    if not restart and (reason := backend.backup_block_reason()):
+        hints = [
+            reason,
+            f"Run 'bu backup-restart {dest.name}' to reset the status and start again.",
+        ]
+        if dest.method == "snapshot":
+            hints.append(
+                f"Run 'bu backup-remove {dest.name}' to discard the incomplete "
+                "snapshot instead."
+            )
+        return {
+            "files_copied": 0,
+            "files_skipped": 0,
+            "bytes_copied": 0,
+            "errors": hints,
+        }
+
     start_ts = datetime.datetime.now(datetime.timezone.utc)
 
     logger = ActionLogger(dest.history_file)
@@ -247,7 +276,6 @@ def action_backup(
     _write_action_header(dest, "backup", start_ts)
     _touch_log_start(dest, "backup", start_ts)
 
-    backend = _build_backend(dest)
     result = backend.backup(dest.source_paths, dry_run=dry_run, extra_args=extra_args, scroll_lines=scroll_lines)
 
     # Log any errors from the backend result
@@ -269,6 +297,36 @@ def action_backup(
     _write_backup_summary(dest, result, dry_run, elapsed=end_ts - start_ts)
 
     return result
+
+
+def action_backup_remove(dest: DestinationConfig) -> dict[str, Any]:
+    """Describe the removable incomplete snapshot for ``bu backup-remove``."""
+    if dest.method != "snapshot":
+        return {
+            "ok": False,
+            "errors": ["backup-remove only applies to snapshot destinations"],
+        }
+    backend = _build_backend(dest)
+    if backend.backup_block_reason() is None:
+        # Completed (or no) status — there is nothing to remove.
+        return {
+            "ok": False,
+            "errors": [f"Backup for {dest.name!r} is complete — nothing to remove."],
+        }
+    info = backend.incomplete_snapshot_info()
+    if info is None:
+        return {
+            "ok": False,
+            "errors": [f"No incomplete snapshot backup found for {dest.name!r}"],
+        }
+    info["ok"] = True
+    return info
+
+
+def action_backup_remove_confirmed(dest: DestinationConfig) -> dict[str, Any]:
+    """Perform the removal after the user has confirmed it."""
+    backend = _build_backend(dest)
+    return backend.remove_incomplete_snapshot()
 
 
 def _write_raw_log(
@@ -350,6 +408,17 @@ def action_restore(
     scroll_lines: int = 0,
 ) -> dict[str, Any]:
     """Restore files from the configured destination."""
+    backend = _build_backend(dest)
+
+    # Restore only from a completed backup: a running or failed run means
+    # the destination may be inconsistent.
+    if reason := backend.backup_block_reason():
+        return {
+            "files_restored": 0,
+            "bytes_restored": 0,
+            "errors": [reason, "Restore is blocked until the backup completes."],
+        }
+
     start_ts = datetime.datetime.now(datetime.timezone.utc)
 
     logger = ActionLogger(dest.history_file)
@@ -358,7 +427,6 @@ def action_restore(
     _write_action_header(dest, "restore", start_ts, restore_to=restore_path)
     _touch_log_start(dest, "restore", start_ts)
 
-    backend = _build_backend(dest)
     result = backend.restore(
         restore_path,
         path_within_backup,
@@ -474,15 +542,34 @@ def action_config(
     # If no name specified, list what's available
     if not name:
         cfg_dir.mkdir(parents=True, exist_ok=True)
-        cfg = Config(cfg_dir)
+        cfg = Config(cfg_dir, strict=False)
         dests = cfg.list_destinations()
         if dests:
+            hint = (
+                "Run 'bu config NAME' to edit a destination, "
+                "or 'bu create' for a guided setup."
+            )
+            if cfg.errors:
+                hint += (
+                    f" Invalid config(s): {', '.join(sorted(cfg.errors))} — "
+                    "fix with 'bu config NAME' or remove with 'bu delete NAME'."
+                )
             return {
                 "ok": True,
                 "config_dir": str(cfg_dir),
                 "destinations": dests,
-                "hint": "Run 'bu config NAME' to edit a destination, "
-                        "or 'bu create' for a guided setup.",
+                "hint": hint,
+            }
+        elif cfg.errors:
+            return {
+                "ok": False,
+                "config_dir": str(cfg_dir),
+                "errors": [
+                    (
+                        f"Invalid config file(s): {', '.join(sorted(cfg.errors))}. "
+                        "Fix with 'bu config NAME' or remove with 'bu delete NAME'."
+                    )
+                ],
             }
         else:
             return {
@@ -901,7 +988,7 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
         snapshots = result.get("snapshots") or []
         latest = result.get("latest_snapshot")
         lines.append(f"Snapshots    : {snap_count}")
-        for snap in reversed(list(snapshots)[-3:]):
+        for snap in reversed(list(snapshots)):
             marker = " ← latest" if snap == latest else ""
             lines.append(f"  {snap}{marker}")
 
@@ -916,6 +1003,16 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
         state = last.get("state", "?")
         state_icon = {"completed": "✓", "started": "…", "error": "✗"}.get(state, "?")
         lines.append(f"  State       : {state_icon} {state}")
+        if state == "started":
+            name = result.get("name", "?")
+            lines.append("  Note        : backup is running — wait for it to finish.")
+            lines.append(
+                f"  Hint        : if it is stuck or failed, run 'bu backup-restart {name}'"
+            )
+            if result.get("method") == "snapshot":
+                lines.append(
+                    f"  Hint        : or 'bu backup-remove {name}' to discard the incomplete snapshot"
+                )
         ts = last.get("timestamp", "")
         if ts:
             try:
@@ -937,5 +1034,17 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
                 lines.append(f"    - {err}")
     elif result.get("status_file_error"):
         lines.append(f"  Status file : corrupt ({result['status_file_error']})")
+
+    # Friendly remediation hints after a FAILED run (not while one is running).
+    if isinstance(last, dict) and last.get("state") == "error":
+        name = result.get("name", "?")
+        lines.append("")
+        lines.append("Next steps")
+        lines.append("----------")
+        lines.append(f"  bu backup-restart {name}    # reset the status and start again")
+        if result.get("method") == "snapshot":
+            lines.append(
+                f"  bu backup-remove {name}     # discard the incomplete snapshot instead"
+            )
 
     return "\n".join(lines)
