@@ -327,6 +327,7 @@ class SnapshotMethod(RsyncMethod):
             "stderr": "\n".join(all_stderr).strip(),
             "snapshot": ts,
             "rsync_version": self._rsync_version(),
+            "notes": self._rsync_notes(),
         }
 
     # ------------------------------------------------------------------

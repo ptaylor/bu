@@ -210,6 +210,33 @@ Per-destination runtime files are stored under `~/.local/state/bu/`:
 - `duplicity` (3.x) and `gpg` — for `method = "duplicity"` destinations
   (local disk or Backblaze B2)
 
+> macOS ships Apple's openrsync as `/usr/bin/rsync`, which cannot copy
+> Unix socket files (e.g. `~/.gnupg/S.gpg-agent*`) to SMB/NFS shares —
+> it fails with `mkstempsock: Operation not supported`. bu passes
+> `--no-specials` so socket/fifo files are skipped (they are runtime
+> objects, not backup data), warns about openrsync, and prefers a full
+> rsync when one is installed (`brew install rsync`, found
+> automatically). You can also force a specific binary with the
+> `BU_RSYNC` environment variable.
+
+> **About `._*` files on SMB/NAS destinations:** when macOS writes any
+> file or folder to an SMB share that doesn't store extended attributes
+> natively (like the WD MyBookLive), it creates a hidden `._name`
+> AppleDouble sidecar next to it. This is macOS behaviour, not bu —
+> copying with Finder does the same. These files contain no backup data
+> and are safe to delete:
+>
+> ```
+> find /Volumes/backups/bogano -name '._*' -delete
+> ```
+>
+> In practice you rarely need to: bu mirrors with `--delete`, so each
+> backup automatically removes leftover `._*` files (they are never in
+> the source), and macOS only recreates them next to files that change
+> in that run. The only way to avoid them entirely is a destination
+> that stores Mac metadata natively (e.g. another Mac, APFS/HFS+
+> volume, or an SMB server with native xattr support).
+
 ## Installation
 
 ```bash

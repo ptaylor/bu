@@ -104,6 +104,13 @@ bu ACTION NAME [ARGS...]
 ### rsync (`src/bu/backends/local.py`)
 
 - Local directories only. `destination = "/mnt/backup"`.
+- rsync binary resolution (`resolve_rsync_binary` in local.py): honors
+  `$BU_RSYNC`; otherwise prefers a full rsync (3.x) on PATH, and when PATH
+  only offers Apple's openrsync it checks `/opt/homebrew/bin/rsync`,
+  `/usr/local/bin/rsync`, `/opt/local/bin/rsync`.  openrsync cannot copy
+  Unix socket files to SMB/NFS (`mkstempsock: Operation not supported`),
+  so bu always passes `--no-specials` (sockets/fifos skipped) and adds a
+  warning to backup/status `notes` when openrsync is in use.
 - Each source is mirrored **directly into the destination** as
   `<destination>/<source basename>/` — there is NO destination-name subfolder.
 - Backup uses `rsync -a --delete` (exact mirror) plus `--stats`, and

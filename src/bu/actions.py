@@ -943,6 +943,9 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
             lines.append(f"errors: {len(value)} error(s)")
             for err in value:
                 lines.append(f"  - {err}")
+        elif key == "notes" and isinstance(value, list) and value:
+            for note in value:
+                lines.append(f"  ℹ {note}")
         elif key == "files" and isinstance(value, list):
             lines.append(f"{key}: {len(value)} file(s)")
         elif isinstance(value, list):
@@ -982,6 +985,9 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
 
     lines.append(f"Dest path    : {result.get('dest_path', '?')}")
     lines.append(f"Dest exists  : {'yes' if result.get('dest_exists') else 'no'}")
+
+    for note in result.get("notes") or []:
+        lines.append(f"ℹ {note}")
 
     snap_count = result.get("snapshot_count")
     if snap_count is not None:

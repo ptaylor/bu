@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,75 @@ from typing import Any, ClassVar
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
 from bu.filters import build_include_rules, read_filter_lines
+
+# ---------------------------------------------------------------------------
+# rsync binary resolution
+# ---------------------------------------------------------------------------
+_RSYNC_CACHE: str | None = None
+
+# Homebrew (ARM/Intel) and MacPorts install a full rsync here; these are
+# checked when PATH only offers Apple's openrsync.
+_RSYNC_CANDIDATES: tuple[str, ...] = (
+    "/opt/homebrew/bin/rsync",
+    "/usr/local/bin/rsync",
+    "/opt/local/bin/rsync",
+)
+
+
+def _is_openrsync(binary: str) -> bool:
+    """True if ``binary`` is Apple's openrsync (or any pre-3.0 rsync)."""
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    head = (proc.stdout or "").split("\n", 1)[0].strip().lower()
+    return "openrsync" in head or head.startswith("rsync  version 2")
+
+
+def resolve_rsync_binary() -> str:
+    """Return the rsync executable to use.
+
+    Order: ``$BU_RSYNC`` override; a full (3.x) rsync on PATH; a known
+    Homebrew/MacPorts rsync if PATH only has Apple's openrsync; else
+    whatever ``rsync`` resolves to (or the bare name as a last resort).
+    """
+    global _RSYNC_CACHE
+    if _RSYNC_CACHE:
+        return _RSYNC_CACHE
+
+    override = os.environ.get("BU_RSYNC", "").strip()
+    if override:
+        _RSYNC_CACHE = override
+        return override
+
+    default = shutil.which("rsync")
+    if default and not _is_openrsync(default):
+        _RSYNC_CACHE = default
+        return default
+
+    for candidate in _RSYNC_CANDIDATES:
+        if os.access(candidate, os.X_OK) and not _is_openrsync(candidate):
+            _RSYNC_CACHE = candidate
+            return candidate
+
+    _RSYNC_CACHE = default or "rsync"
+    return _RSYNC_CACHE
+
+
+def _openrsync_warning(binary: str) -> str | None:
+    """Advisory note when the resolved rsync is Apple's openrsync."""
+    if _is_openrsync(binary):
+        return (
+            "rsync is Apple's openrsync (2.x). Socket/fifo files are "
+            "skipped (--no-specials); on SMB/NFS shares openrsync cannot "
+            "copy socket files (mkstempsock error). Installing a full "
+            "rsync ('brew install rsync') or setting BU_RSYNC is "
+            "recommended."
+        )
+    return None
 
 
 class RsyncMethod(Backend):
@@ -43,6 +113,16 @@ class RsyncMethod(Backend):
 
     # Method name recorded in status files and reports.
     METHOD_NAME: ClassVar[str] = "rsync"
+
+    @property
+    def rsync_binary(self) -> str:
+        """Resolved rsync executable (honors BU_RSYNC, prefers a full rsync)."""
+        return resolve_rsync_binary()
+
+    def _rsync_notes(self) -> list[str]:
+        """Advisory notes about the rsync binary in use."""
+        warning = _openrsync_warning(self.rsync_binary)
+        return [warning] if warning else []
 
     def _dest_dir(self) -> Path:
         """Return the destination directory (sources are mirrored directly into it)."""
@@ -187,6 +267,7 @@ class RsyncMethod(Backend):
             "stdout": "\n".join(all_stdout).strip(),
             "stderr": "\n".join(all_stderr).strip(),
             "rsync_version": self._rsync_version(),
+            "notes": self._rsync_notes(),
         }
 
     # ------------------------------------------------------------------
@@ -263,7 +344,8 @@ class RsyncMethod(Backend):
         """Return the rsync version string, or empty on failure."""
         try:
             proc = subprocess.run(
-                ["rsync", "--version"], capture_output=True, text=True, check=False,
+                [self.rsync_binary, "--version"],
+                capture_output=True, text=True, check=False,
             )
             # First line is typically "rsync  version 3.x.x  ..."
             return proc.stdout.split("\n")[0].strip()
@@ -337,6 +419,8 @@ class RsyncMethod(Backend):
         unchanged files are hard-linked from a previous backup (snapshot
         method); ``include_patterns`` adds ``--include`` filter rules and
         a trailing ``--exclude=*`` so only the listed paths are backed up.
+        Socket/fifo files are always skipped via ``--no-specials`` (they
+        are runtime objects, and SMB/NFS cannot store Unix sockets).
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
         Returns ``{files, bytes, errors, stdout, stderr}``.
@@ -346,7 +430,9 @@ class RsyncMethod(Backend):
             dest.parent.mkdir(parents=True, exist_ok=True)
 
         # Trailing slash on src: copy *contents*, not the directory itself.
-        cmd = ["rsync", "-a", "-h", "--stats", "-v"]
+        # --no-specials: skip socket/fifo files (runtime objects; SMB/NFS
+        # cannot store Unix sockets and openrsync aborts on them).
+        cmd = [self.rsync_binary, "-a", "--no-specials", "-h", "--stats", "-v"]
         if sys.stdout.isatty():
             cmd.append("--progress")
         if delete:
@@ -380,6 +466,13 @@ class RsyncMethod(Backend):
             stderr = proc.stderr.strip()
             if stderr:
                 errors.append(stderr)
+                if "mkstempsock" in stderr:
+                    errors.append(
+                        "openrsync failed to copy a socket file (SMB/NFS "
+                        "cannot store Unix sockets). bu passes --no-specials "
+                        "to skip them — install a full rsync ('brew install "
+                        "rsync') if this persists."
+                    )
 
         # Parse --stats summary for file count and byte total
         files_str = self._parse_rsync_stat(proc.stdout, r"Number of (?:regular )?files(?: transferred)?:\s+([\d,]+)")
@@ -451,6 +544,7 @@ class RsyncMethod(Backend):
         else:
             result["last_backup"] = None
 
+        result["notes"] = self._rsync_notes()
         return result
 
     # --- helpers (only _parse_rsync_stat retained for backup) ---
