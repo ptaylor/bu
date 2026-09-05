@@ -129,6 +129,22 @@ class DestinationConfig:
             self._per_source_includes.append(include or [])
             self._per_source_excludes.append(exclude)
 
+        # rsync mirrors each source as <destination>/<basename> — two sources
+        # with the same basename would overwrite each other (with --delete,
+        # the later one wins and the other source's files are deleted).
+        # duplicity/snapshot dedupe with _2 suffixes, so they are unaffected.
+        if self.method == "rsync":
+            seen: dict[str, str] = {}
+            for src in self.source_paths:
+                base = Path(src).expanduser().name or src
+                if base in seen:
+                    raise ConfigError(
+                        f"source_paths {seen[base]!r} and {src!r} have the same "
+                        f"directory name {base!r} — rsync mirrors each source as "
+                        f"<destination>/{base}, so they would overwrite each other"
+                    )
+                seen[base] = src
+
         self.extra: dict[str, Any] = {
             k: v for k, v in data.items()
             if k not in _RESERVED_KEYS

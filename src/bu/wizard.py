@@ -433,6 +433,13 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
         if not p.is_dir():
             _error(f"Not a directory: {raw}")
             continue
+        if method == "rsync" and any(Path(s).name == p.name for s in sources):
+            _error(
+                f"{p.name!r} already used by another source — rsync mirrors "
+                f"each source as <destination>/{p.name}, so same-named "
+                "directories would overwrite each other"
+            )
+            continue
         sources.append(str(Path(raw).expanduser()))
         if not _prompt_yes_no("add another source?"):
             break

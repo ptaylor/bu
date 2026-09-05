@@ -54,3 +54,32 @@ def test_list_clean_configs_exits_zero(cfg_dir, monkeypatch):
     assert result.exit_code == 0
     assert "good" in result.output
     assert "invalid" not in result.output
+
+
+def test_rsync_rejects_duplicate_source_basenames(cfg_dir):
+    _write(
+        cfg_dir,
+        "dup",
+        'method = "rsync"\nsource_paths = ["/a/foo", "/b/foo"]\ndestination = "/mnt"\n',
+    )
+    cfg = Config(cfg_dir, strict=False)
+    assert "dup" in cfg.errors
+    assert "overwrite each other" in cfg.errors["dup"]
+    with pytest.raises(ConfigError):
+        Config(cfg_dir)
+
+
+def test_other_methods_allow_duplicate_basenames(cfg_dir):
+    _write(
+        cfg_dir,
+        "snap",
+        'method = "snapshot"\nsource_paths = ["/a/foo", "/b/foo"]\ndestination = "/mnt"\n',
+    )
+    _write(
+        cfg_dir,
+        "dupc",
+        'method = "duplicity"\nsource_paths = ["/a/foo", "/b/foo"]\ndestination = "/mnt"\n',
+    )
+    cfg = Config(cfg_dir, strict=False)
+    assert not cfg.errors
+    assert cfg.list_destinations() == ["dupc", "snap"]
