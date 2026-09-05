@@ -753,6 +753,8 @@ class DuplicityMethod(Backend):
                 "dest_exists": base.is_dir(),
             }
 
+        result["exclude_files"] = list(self.config.get("_exclude_files", []))
+
         # Source existence checks plus per-source filter files
         sources_status: list[dict[str, Any]] = []
         for idx, sp in enumerate(source_paths):

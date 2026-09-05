@@ -725,6 +725,29 @@ def action_config(
                     "errors": [f"{key!r} must be a string or a list of strings."],
                 }
 
+    # rsync mirrors each source as <destination>/<basename>; same-named
+    # sources would overwrite each other (duplicity/snapshot dedupe).
+    if raw_method == "rsync":
+        seen: dict[str, str] = {}
+        for entry in source_paths:
+            src = entry if isinstance(entry, str) else entry.get("path", "")
+            base = Path(src).expanduser().name or src
+            if base in seen:
+                return {
+                    "ok": False,
+                    "name": name,
+                    "created": created,
+                    "file": str(file_path),
+                    "errors": [
+                        (
+                            f"source_paths {seen[base]!r} and {src!r} have the same "
+                            f"directory name {base!r} — rsync mirrors each source as "
+                            f"<destination>/{base}, so they would overwrite each other"
+                        )
+                    ],
+                }
+            seen[base] = src
+
     raw_dest = raw.get("destination", "")
     if not raw_dest:
         return {
@@ -984,7 +1007,18 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
                 lines.append(f"  {sp}")
 
     lines.append(f"Dest path    : {result.get('dest_path', '?')}")
-    lines.append(f"Dest exists  : {'yes' if result.get('dest_exists') else 'no'}")
+    dest_exists = result.get("dest_exists")
+    if dest_exists is None:
+        lines.append("Dest exists  : n/a (remote destination)")
+    else:
+        lines.append(f"Dest exists  : {'yes' if dest_exists else 'no'}")
+
+    exclude_files = result.get("exclude_files")
+    if exclude_files:
+        lines.append("Exclude files:")
+        for f in exclude_files:
+            missing = "" if Path(f).expanduser().is_file() else " (missing)"
+            lines.append(f"  {f}{missing}")
 
     for note in result.get("notes") or []:
         lines.append(f"ℹ {note}")

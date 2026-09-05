@@ -277,6 +277,36 @@ def test_format_status_shows_filter_files() -> None:
     assert "missing.txt (missing)" in out
 
 
+def test_format_status_remote_dest_exists_is_na() -> None:
+    out = format_status({
+        "name": "docs",
+        "method": "duplicity",
+        "sources": [],
+        "dest_path": "b2://bucket/docs",
+        "dest_exists": None,
+        "last_backup": None,
+    })
+    assert "Dest exists  : n/a (remote destination)" in out
+
+
+def test_format_status_shows_common_exclude_files() -> None:
+    out = format_status({
+        "name": "docs",
+        "method": "rsync",
+        "sources": [],
+        "dest_path": "/mnt/backup",
+        "dest_exists": True,
+        "exclude_files": [
+            "/Users/paul/.config/bu/exclude.txt",
+            "/Users/paul/.config/bu/missing.txt",
+        ],
+        "last_backup": None,
+    })
+    assert "Exclude files:" in out
+    assert "/Users/paul/.config/bu/exclude.txt" in out
+    assert "missing.txt (missing)" in out
+
+
 def test_duplicity_include_and_exclude_args(env: Path) -> None:
     inc = env / "include.txt"
     inc.write_text("docs\ncode/proj\n")

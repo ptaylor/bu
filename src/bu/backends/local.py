@@ -517,6 +517,7 @@ class RsyncMethod(Backend):
             "source_paths": source_paths,
             "dest_path": str(dest_dir),
             "dest_exists": dest_dir.is_dir(),
+            "exclude_files": list(self.config.get("_exclude_files", [])),
         }
 
         # Check existence of each source path plus its filter files
