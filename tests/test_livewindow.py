@@ -76,3 +76,21 @@ def test_status_context_is_shown_without_output_rows() -> None:
     )
     assert "/source/path" in out
     assert "[00:0" in out
+
+
+def test_rows_cap_at_width_minus_one_and_end_with_crlf() -> None:
+    out = _run_with_pty(
+        "from bu.backends.base import LiveWindow\n"
+        "w = LiveWindow(2, status_interval=0.05, title='t')\n"
+        "w.__enter__()\n"
+        "w.write('A' * 100 + '\\n')\n"
+        "w.write('B' * 40 + '\\n')\n"
+        "w.__exit__(None, None, None)\n"
+    )
+    assert "\x1b[?7l" in out   # auto-wrap disabled while the window is active
+    assert "\x1b[?7h" in out   # restored on exit
+    assert "A" * 100 not in out
+    # A 100-char row is capped at width-1 (79 on the 80-col PTY) and
+    # terminated with \r\n. The PTY's ONLCR doubles the \r on the wire
+    # (\r\n → \r\r\n); a bare \n at the last column would show as a single \r.
+    assert "A" * 79 + "\r\r\n" in out

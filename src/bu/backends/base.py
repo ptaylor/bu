@@ -39,6 +39,9 @@ class LiveWindow:
     Rows are sanitised (ANSI escape codes stripped, backspaces emulated)
     so tools like duplicity can't corrupt the display; the terminal width
     is re-read on every repaint so a resize doesn't scramble the layout.
+    Rows are capped at width-1 and end in \r\n, and terminal auto-wrap is
+    disabled while the window is active (restored on exit), so a wide row
+    can never wrap into the rows below it.
     Auto-disabled when stdout is not a TTY (plain passthrough).
     """
 
@@ -68,10 +71,11 @@ class LiveWindow:
         if self.lines <= 0 or not sys.stdout.isatty() or self.active:
             return self
         try:
-            self._width = shutil.get_terminal_size().columns
+            size = shutil.get_terminal_size()
         except OSError:
             return self
-        if self._width < 20:
+        self._width = size.columns
+        if self._width < 20 or size.lines < self.lines + 3:
             return self
         # Title bar above the window: "── Title ──────…"
         rule = "─" * max(0, self._width - len(self.title) - 3)
@@ -79,6 +83,10 @@ class LiveWindow:
         # Reserve window + dividing rule + status rows, then move cursor back
         sys.stdout.write("\n" * (self.lines + 2))
         sys.stdout.write(f"\033[{self.lines + 2}A")
+        # Disable terminal auto-wrap: if a row ever exceeds the width (stale
+        # terminal size, resize race), the terminal truncates it at the right
+        # margin instead of wrapping and scrambling the fixed-height block.
+        sys.stdout.write("\033[?7l")
         sys.stdout.flush()
         self._start = time.monotonic()
         self._last_status_paint = -1.0
@@ -117,6 +125,7 @@ class LiveWindow:
             self._redraw()
             # The cursor sits on the status row after a redraw;
             # move below it so the final summary prints fresh.
+            sys.stdout.write("\033[?7h")   # restore terminal auto-wrap
             sys.stdout.write("\n")
             sys.stdout.flush()
             self.active = False
@@ -199,24 +208,27 @@ class LiveWindow:
         # Move cursor up to the first output row of the window block.
         if self._painted:
             sys.stdout.write(f"\033[{self._painted + 1}A")
-        # Always paint exactly `lines` output rows (blank-filling the rest)
+        # Always paint exactly `lines` output rows (blank-filling the rest).
+        # Rows are capped at width-1 and terminated with \r\n: a row filling
+        # the last column would leave the cursor wrap-pending, shifting every
+        # following row down a line and scrambling the window block.
         for i in range(self.lines):
             sys.stdout.write("\033[2K")       # erase whole line
             if i < len(self._buf):
-                sys.stdout.write(self._colour_row(self._buf[i][: self._width - 1]))
-            sys.stdout.write("\n")
+                sys.stdout.write(self._colour_row(self._buf[i][: max(0, self._width - 1)]))
+            sys.stdout.write("\r\n")
         self._painted = self.lines
         # Yellow dividing rule above the status line, matching the title bar
         sys.stdout.write("\033[2K")
-        sys.stdout.write(f"\033[1;33m{'─' * self._width}\033[0m")
-        sys.stdout.write("\n")
+        sys.stdout.write(f"\033[1;33m{'─' * max(0, self._width - 1)}\033[0m")
+        sys.stdout.write("\r\n")
         # Status line below the window — throttled to update infrequently
         now = time.monotonic()
         if self._last_status_paint < 0 or now - self._last_status_paint >= self.status_interval:
             elapsed = now - self._start
             status = f"[{int(elapsed) // 60:02d}:{int(elapsed) % 60:02d}] {self._context}"
             sys.stdout.write("\033[2K")
-            sys.stdout.write(f"\033[1;36m{status[: self._width]}\033[0m")
+            sys.stdout.write(f"\033[1;36m{status[: max(0, self._width - 1)]}\033[0m")
             self._last_status_paint = now
         sys.stdout.flush()
 
