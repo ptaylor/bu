@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
-from bu.filters import build_include_rules, read_filter_lines
+from bu.filters import build_include_rules, read_filter_lines, trailing_whitespace_warnings
 
 # ---------------------------------------------------------------------------
 # rsync binary resolution
@@ -120,9 +120,28 @@ class RsyncMethod(Backend):
         return resolve_rsync_binary()
 
     def _rsync_notes(self) -> list[str]:
-        """Advisory notes about the rsync binary in use."""
+        """Advisory notes about the rsync binary and exclusion files in use."""
+        notes: list[str] = []
         warning = _openrsync_warning(self.rsync_binary)
-        return [warning] if warning else []
+        if warning:
+            notes.append(warning)
+        # Exclusion files are passed to rsync verbatim, and rsync treats
+        # trailing whitespace as part of the pattern — warn before a
+        # silently-unmatched pattern copies data the user meant to exclude.
+        notes.extend(trailing_whitespace_warnings(self._exclusion_files()))
+        return notes
+
+    def _exclusion_files(self) -> list[str]:
+        """All exclusion files passed to rsync (destination + per-source)."""
+        files: list[str] = list(self.config.get("_exclude_files", []))
+        for per_source in self.config.get("_source_excludes", []) or []:
+            if per_source:
+                files.extend(per_source)
+        return files
+
+    def preflight_notes(self) -> list[str]:
+        """Warnings to show before a backup starts (filter-file footguns)."""
+        return trailing_whitespace_warnings(self._exclusion_files())
 
     def _dest_dir(self) -> Path:
         """Return the destination directory (sources are mirrored directly into it)."""

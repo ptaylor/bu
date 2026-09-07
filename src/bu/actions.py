@@ -273,6 +273,13 @@ def action_backup(
     logger = ActionLogger(dest.history_file)
     logger.start("backup", dest.name)
 
+    # Advisory warnings before a possibly-hours-long run starts, e.g.
+    # exclusion patterns with trailing whitespace that rsync would
+    # silently treat as part of the pattern (so they never match).
+    for note in backend.preflight_notes():
+        sys.stderr.write(f"Warning: {note}\n")
+    sys.stderr.flush()
+
     _write_action_header(dest, "backup", start_ts)
     _touch_log_start(dest, "backup", start_ts)
 

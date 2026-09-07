@@ -369,6 +369,15 @@ class Backend(ABC):
         """Delete the status file so the next backup starts unblocked."""
         self._status_path().unlink(missing_ok=True)
 
+    def preflight_notes(self) -> list[str]:
+        """Advisory warnings to show before a backup starts.
+
+        Defaults to none; backends override this for configuration
+        footguns that don't block the run (e.g. exclusion patterns that
+        rsync would silently ignore).
+        """
+        return []
+
     @abstractmethod
     def backup(
         self,

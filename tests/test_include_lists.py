@@ -11,7 +11,7 @@ from bu.backends.duplicity import DuplicityMethod
 from bu.backends.local import RsyncMethod
 from bu.backends.snapshot import SnapshotMethod
 from bu.config import Config, ConfigError
-from bu.filters import build_include_rules
+from bu.filters import build_include_rules, trailing_whitespace_warnings
 
 
 @pytest.fixture()
@@ -251,6 +251,31 @@ def test_status_reports_filter_files(env: Path) -> None:
     st2 = m2.status()
     assert st2["sources"][0]["include_files"] == []
     assert st2["sources"][0]["exclude_files"] == [str(exc)]
+
+
+def test_trailing_whitespace_warnings(env: Path) -> None:
+    exc = env / "exc.txt"
+    exc.write_text("*.tmp\nPictures/Takeout \n# comment \n\n")
+    warnings = trailing_whitespace_warnings([str(exc), str(env / "missing.txt")])
+    assert len(warnings) == 1
+    assert "'Pictures/Takeout'" in warnings[0]
+    assert "line 2" in warnings[0]
+
+
+def test_status_warns_on_trailing_whitespace_excludes(env: Path) -> None:
+    src = env / "src"
+    src.mkdir()
+    dest = env / "dest"
+    dest.mkdir()
+    exc = env / "exc.txt"
+    exc.write_text("Pictures/Takeout \n")
+
+    m = make_rsync(dest, src, include=None, exclude=[str(exc)])
+    notes = m.status()["notes"]
+    assert any("trailing whitespace" in n and "exc.txt" in n for n in notes)
+    # The same warning is surfaced before a backup starts.
+    pre = m.preflight_notes()
+    assert any("trailing whitespace" in n and "exc.txt" in n for n in pre)
 
 
 def test_format_status_shows_filter_files() -> None:

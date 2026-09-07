@@ -142,6 +142,10 @@ One pattern per line, with identical rules for rsync and duplicity:
 the top level of each source
 - `+ ` include / `- ` exclude modifiers; `#` comments and blank lines are ignored
 
+> **Watch out:** rsync keeps trailing spaces as part of the pattern, so
+> `Pictures/Takeout ` (with a stray space) silently never matches.
+> `bu backup`/`bu status` warn about such lines.
+
 A pattern matching a directory also excludes its contents. bu passes the
 file to rsync as-is and translates each pattern for duplicity (which
 requires `**/`-prefixed globs or source-absolute paths).

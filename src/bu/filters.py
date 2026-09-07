@@ -54,3 +54,28 @@ def build_include_rules(paths: list[str]) -> list[str]:
                 seen.add(rule)
                 rules.append(rule)
     return rules
+
+
+def trailing_whitespace_warnings(paths: list[str]) -> list[str]:
+    """Warn about exclusion-file patterns with trailing whitespace.
+
+    rsync reads these files itself and keeps trailing spaces as part of
+    the pattern, so a line like ``Pictures/Takeout `` silently never
+    matches.  Missing files and blank/comment lines are ignored; one
+    warning is returned per offending line.
+    """
+    warnings: list[str] = []
+    for path in paths:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            continue
+        for lineno, raw in enumerate(p.read_text(errors="replace").splitlines(), 1):
+            stripped = raw.rstrip()
+            if not stripped or stripped.startswith("#") or stripped == raw:
+                continue
+            warnings.append(
+                f"exclusion pattern {stripped!r} in {p} (line {lineno}) has "
+                "trailing whitespace — rsync keeps the space, so the pattern "
+                "never matches"
+            )
+    return warnings

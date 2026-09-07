@@ -122,6 +122,11 @@ bu ACTION NAME [ARGS...]
 - Status file: `<destination>/bu-<NAME>-status.txt` (JSON content), written at
   backup start/end (`started`/`completed`/`error`). Dry-runs write nothing.
   The status file is NOT synced back on restore.
+- rsync reads exclusion files itself and keeps trailing whitespace as part
+  of the pattern, so `Pictures/Takeout ` (stray space) silently never
+  matches. `bu backup` prints such lines as warnings before the run starts
+  (via `Backend.preflight_notes`, overridden by `RsyncMethod`); `bu status`
+  repeats them in `notes` (`trailing_whitespace_warnings` in filters.py).
 
 ### snapshot (`src/bu/backends/snapshot.py`)
 
