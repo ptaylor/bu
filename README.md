@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/bu-icon.svg" width="88" height="88" alt="bu icon">
+</p>
+
 # bu
 
 Backup utility that mirrors directories with rsync, timestamped hard-linked
@@ -282,4 +286,5 @@ bu help backup
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The icon source (`assets/icons/bu-icon.svg`) and
+its raster set (PNG sizes + `favicon.ico`) are covered by the same licence.
