@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bu — icon</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 26px 24px 34px;
+    width: 660px;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: #0a0d14;
+    color: #e6ebf5;
+  }
+  h1 { font-size: 20px; margin: 0 0 5px; letter-spacing: -0.01em; }
+  p.sub { margin: 0 0 22px; color: #8b97ad; font-size: 13px; }
+  .card {
+    background: #121824; border: 1px solid #212b3d; border-radius: 16px; padding: 18px;
+  }
+  .hero { display: flex; gap: 14px; margin-bottom: 16px; }
+  .tile {
+    flex: 1; height: 164px; border-radius: 14px;
+    display: grid; place-items: center; border: 1px solid #212b3d;
+  }
+  .tile.dark { background: #0f1420; }
+  .tile.light { background: #f2f5fb; border-color: #dfe5f0; }
+  .tile img { width: 128px; height: 128px; }
+  .row {
+    display: flex; align-items: center; gap: 18px; padding: 12px 16px;
+    border-radius: 11px; margin-top: 8px;
+  }
+  .row.dark { background: #0f1420; }
+  .row.light { background: #f2f5fb; }
+  .cap {
+    font: 500 9.5px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.07em; text-transform: uppercase; width: 116px; flex: 0 0 auto;
+  }
+  .dark .cap { color: #8b97ad; }
+  .light .cap { color: #64748b; }
+  .row .set { display: flex; align-items: center; gap: 16px; }
+  .note { margin: 14px 2px 0; color: #6f7c93; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>bu — icon</h1>
+  <p class="sub">Archive cylinder + restore cycle, in the Layers palette. 512×512 source, scales to favicon.</p>
+
+  <div class="card">
+    <div class="hero">
+      <div class="tile dark"><img src="bu-icon.svg" alt="bu icon on dark"></div>
+      <div class="tile light"><img src="bu-icon.svg" alt="bu icon on light"></div>
+    </div>
+
+    <div class="row dark">
+      <span class="cap">64 / 32 / 16</span>
+      <div class="set">
+        <img src="bu-icon.svg" width="64" height="64">
+        <img src="bu-icon.svg" width="32" height="32">
+        <img src="bu-icon.svg" width="16" height="16">
+      </div>
+    </div>
+    <div class="row light">
+      <span class="cap">64 / 32 / 16</span>
+      <div class="set">
+        <img src="bu-icon.svg" width="64" height="64">
+        <img src="bu-icon.svg" width="32" height="32">
+        <img src="bu-icon.svg" width="16" height="16">
+      </div>
+    </div>
+  </div>
+
+  <p class="note">Source of truth: bu-icon.svg — no external assets, no fonts, no rasterisation required.</p>
+</body>
+</html>

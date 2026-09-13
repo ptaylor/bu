@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="bu: backup archive with restore cycle">
+  <title>bu</title>
+  <defs>
+    <!-- ring: option 01 top-layer blues -->
+    <linearGradient id="bu-ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7CB2FF"/>
+      <stop offset="1" stop-color="#2F6FE0"/>
+    </linearGradient>
+    <!-- archive body: option 01 mid/bottom blues -->
+    <linearGradient id="bu-body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4C8DF6"/>
+      <stop offset="1" stop-color="#1E4FB8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- archive cylinder: each backup is another layer -->
+  <path d="M160 240v72a96 38 0 0 0 192 0v-72z" fill="url(#bu-body)"/>
+  <ellipse cx="256" cy="240" rx="96" ry="38" fill="#A9CBFF"/>
+
+  <!-- restore / rewind cycle -->
+  <circle cx="256" cy="256" r="176" fill="none" stroke="url(#bu-ring)" stroke-width="34"
+          stroke-linecap="round" stroke-dasharray="860 246" transform="rotate(-64 256 256)"/>
+  <path d="M144.2 110.4L141.1 172.5L86.1 132.5Z" fill="#4C8DF6"/>
+</svg>
