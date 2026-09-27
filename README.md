@@ -13,7 +13,7 @@ snapshots, or encrypted incremental duplicity archives (local disk or Backblaze 
 bu ACTION [ARGS...]
 ```
 
-- **`ACTION`** — one of: `backup`, `backup-restart`, `backup-remove`, `backup-dry-run`, `restore`, `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`, `create`, `help`
+- **`ACTION`** — one of: `backup`, `backup-restart`, `backup-remove`, `backup-dry-run`, `restore`, `restore-test`, `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`, `create`, `help`
 - **`NAME`** — a named destination defined in the configuration
 
 Commands take positional arguments only — no flags to remember. Use `bu help`
@@ -28,6 +28,7 @@ Commands take positional arguments only — no flags to remember. Use `bu help`
 | `bu backup-remove NAME` | Remove an incomplete snapshot directory (snapshot only; refuses when the last run completed; asks for confirmation) |
 | `bu backup-dry-run NAME` | List the files the next backup would consider, writing nothing. Paths stream to stdout as they are found; the filters in effect and the totals go to stderr |
 | `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes; refuses while the last backup is not `completed`) |
+| `bu restore-test NAME` | Restore the last backup's marker files into a temporary directory and verify them — proves the backup is readable. Read-only; refuses while the last backup is not `completed` |
 | `bu status NAME` | Show config, destination state, and last backup details |
 | `bu list` | List all configured destinations |
 | `bu config [NAME]` | Edit (or create) a destination config in `$EDITOR` |
@@ -106,6 +107,7 @@ confirmation).
 | `history_file` | No | Path to structured JSON-lines action history |
 | `log_file` | No | Path to raw execution log |
 | `exclude_files` | No | List of exclusion files; defaults to `exclude.txt` (global) + `exclude-NAME.txt` (per destination) |
+| `restore_test_dirs` | No | Absolute paths inside the sources that receive a marker file before every backup, so `bu restore-test` can verify the backup (see below) |
 | `passphrase_file` | No | duplicity: file whose first line holds the GPG passphrase (perms 0600) |
 | `full_if_older_than` | No | duplicity: force a full backup when the last one is older than this (e.g. `"30D"`) |
 | `verbosity` | No | duplicity: output verbosity 0-9 (default: automatic; 9 is debug-level and very noisy) |
@@ -187,6 +189,56 @@ consulted first — so a `+ ` exception here can override a broad default.
   line stops updating that path but never deletes the copy already in the
   backup (excluded files are protected from `--delete`).
 
+### Restore-test markers (optional)
+
+A backup is only worth having if you can read it back. Point
+`restore_test_dirs` at one or more directories inside your sources and `bu`
+writes a marker file into each of them **before** every backup:
+
+```toml
+restore_test_dirs = [
+    "/Users/paul",
+    "/Users/paul/Library/CloudStorage/Dropbox",
+]
+```
+
+Entries are absolute paths that must sit inside one of that destination's
+source paths — a stray entry is reported as a warning by `bu status` and
+`bu backup` and then skipped, so it can never block a backup. `bu create`
+fills this in with the root of every source it is given.
+
+Before each source is transferred, bu creates the directory if it does not
+exist and appends the backup's run identifier to `backup-status-<name>.txt`
+inside it: the snapshot directory name for `snapshot` destinations, a UTC
+timestamp otherwise. The marker is then backed up like any other file, so the
+newest copy records which run wrote it.
+
+`bu restore-test NAME` reads the identifiers the last completed backup
+recorded, restores each marker file from the destination into a temporary
+directory, and checks that its newest entry is the run that just completed.
+A pass proves the newest backup is both present and readable. The temporary
+directory is always removed, and neither the destination nor the source trees
+are modified. Nothing is checked when no `restore_test_dirs` are configured.
+
+> A marker at the **root** of a source is let through that source's include
+> list, which would otherwise skip anything not listed — so an
+> `include-home.txt`-style list needs no marker entry. A marker in a
+> *subdirectory* must be covered by the list like any other path, and an
+> exclusion pattern matching the marker wins over it. `bu status` and
+> `bu backup` warn about both.
+
+> bu records each directory's **real on-disk name**. macOS volumes are
+> case-insensitive but case-*preserving*, so a configured `.../backups` can
+> name a folder actually called `Backups`; the backup stores the on-disk
+> spelling, and a destination on a case-**sensitive** volume (external disks
+> are often formatted Case-sensitive APFS) would not find the configured one.
+> Recording the configured spelling would make `bu restore-test` report
+> `Backup path not found` even though the marker is present.
+
+> When a source is cloud-synced (Dropbox, Google Drive) the marker file is
+> uploaded like any other file and appears on your other devices. It is a few
+> dozen bytes plus one line per backup.
+
 ### Creating a config
 
 ```bash
@@ -198,7 +250,7 @@ destination, credentials, method, and source paths, then writes the config.
 For snapshot destinations it verifies hard-link support on the destination
 before writing the config. It also sets `exclude_files` to the global and
 per-name exclusion files, creating both (with sensible defaults) if neither
-exists yet.
+exists yet, and sets `restore_test_dirs` to the root of every source path.
 Alternatively, `bu config photos` opens `$EDITOR` (default `vi`) with a
 pre-filled template; after saving, the TOML is validated.
 
@@ -301,6 +353,9 @@ bu restore photos ./restore
 
 # Or restore just one folder within the backup
 bu restore photos ./restore Photos
+
+# Check the newest backup is actually readable (uses restore_test_dirs)
+bu restore-test photos
 
 # snapshot destinations restore from the newest snapshot by default;
 # a timestamp PATH picks an older one

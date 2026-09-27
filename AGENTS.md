@@ -12,7 +12,7 @@ bu ACTION NAME [ARGS...]
 ```
 
 - `ACTION` is one of: `backup`, `backup-restart`, `backup-remove`,
-  `backup-dry-run`, `restore`, `status`, `list`, `config`, `delete`,
+  `backup-dry-run`, `restore`, `restore-test`, `status`, `list`, `config`, `delete`,
   `history`, `log`, `encrypt`, `create`, `help`.
 - `NAME` is a named destination that exists as a `.toml` config file
   (except `list`, `encrypt`, `create`, and bare `config`, which take no
@@ -68,8 +68,8 @@ bu ACTION NAME [ARGS...]
   `BU_CONFIG_DIR`). Example: `~/.config/bu/photos.toml`.
 - Required keys: `method` (`"rsync"`, `"duplicity"`, or `"snapshot"`), `source_paths`
   (list of directories), `destination` (path or URL).
-- Optional keys: `history_file`, `log_file`, `exclude_files`, plus
-  method-specific extras.
+- Optional keys: `history_file`, `log_file`, `exclude_files`,
+  `restore_test_dirs`, plus method-specific extras.
 - `exclude_files` (list) defaults to `<config_dir>/exclude.txt` (global) and
   `<config_dir>/exclude-<name>.txt` (per destination); the key replaces the
   defaults. Missing files are skipped by the backends. Shared
@@ -115,6 +115,50 @@ bu ACTION NAME [ARGS...]
   rsync/snapshot + URL-ish destination → error ("rsync and snapshot are
   local-only");
   duplicity with `b2:/...` (missing `//`) → error.
+
+### Restore-test markers (`restore_test_dirs`)
+
+- The key lists **absolute paths inside the source trees**.  A path outside
+  every source tree is a *warning* (`Backend.restore_test_notes()`, surfaced by
+  `preflight_notes()` for backups and by `status()` notes) and is skipped —
+  never an error, so a stale entry cannot block a backup.  Nested sources
+  (Dropbox inside `$HOME`) are owned by the longest matching prefix.
+- Before each source is transferred, `Backend.write_restore_markers()` creates
+  the directory if missing and appends the run id to
+  `backup-status-<name>.txt` inside it.  The append is skipped when the last
+  line already equals the value, so `bu backup-restart` resuming the same
+  snapshot timestamp cannot duplicate an entry either.
+- The run id is the status file's `run_id`: the snapshot directory name for
+  snapshot, an ISO-8601 UTC timestamp for rsync/duplicity.  The status file
+  also records `restore_test` (dir, source, source_subdir, rel_dir,
+  marker_file), so `bu restore-test` verifies what was actually written rather
+  than what the config says now.
+- Marker paths reuse the backends' source-basename dedup (`_2`) through
+  `Backend._source_subdirs()`, so a marker never names the wrong archive or
+  snapshot subdirectory.
+- Directory paths are canonicalised to their **on-disk spelling**
+  (`base.on_disk_path`, which resolves symlinks first) before being recorded as
+  `dir`/`rel_dir`.  macOS volumes are case-insensitive but case-*preserving*, so
+  a configured `.../backups` can name an existing `Backups`; the backup stores
+  the on-disk name, and the destination may be Case-sensitive APFS (external
+  disks often are).  Recording the configured spelling makes `bu restore-test`
+  report `Backup path not found` for a marker that is present — verified live on
+  `/Volumes/orange` and reproduced on a Case-sensitive APFS image.
+- A marker at the **root** of a source must survive that source's include list:
+  the closing `--exclude=*` / `--exclude=**` would drop it, since it is never in
+  anybody's include file.  `filters.marker_include_rules()` (rsync
+  `+ /backup-status-<name>.txt`) and duplicity's `_include_args`
+  (`--include=<src>/<marker>`) emit the marker rule *ahead of* the include-list
+  rules, and only when the source has include rules at all.  A marker in a
+  subdirectory gets no such exemption and must be covered by the list.
+- `bu restore-test NAME` refuses unless the last run is `completed`, restores
+  each marker with `extra_args={"non_interactive": True, "quiet": True}` into a
+  `tempfile.mkdtemp()` directory, compares the last non-blank line to `run_id`,
+  always removes the temp tree, and exits 1 on any failure.  Snapshot prefixes
+  the status's snapshot name, so the recorded snapshot is verified rather than
+  whatever is newest.  duplicity resolves its passphrase without prompting.
+- `bu backup-dry-run` writes no markers (it writes nothing at all), and
+  `bu create` writes `restore_test_dirs` for the root of every source path.
 
 ## Method patterns
 
@@ -237,7 +281,8 @@ bu ACTION NAME [ARGS...]
   to review them.  It also creates an empty `include-<name>.txt` and writes a
   commented-out per-source include example
   (`# source_paths = [{ path = ..., include = ... }]`) in the generated
-  config.
+  config, plus `restore_test_dirs` listing the root of every collected source
+  path.
 - `src/bu/backends/base.py` — `Backend` ABC, `LiveWindow` (docker-style
   redraw, title + yellow divider + status line showing elapsed time and the
   current source path via `set_context`), `run_streaming`.
