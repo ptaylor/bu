@@ -15,9 +15,12 @@ import datetime
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -194,6 +197,85 @@ class RsyncMethod(Backend):
         elif not os.access(base, os.W_OK):
             errors.append(f"Destination not writable: {base}")
         return errors
+
+    # ------------------------------------------------------------------
+    # file listing (bu backup-dry-run)
+    # ------------------------------------------------------------------
+
+    def list_files(
+        self,
+        source_paths: list[str],
+        *,
+        on_source: Callable[[dict[str, Any]], None] | None = None,
+        on_path: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """List the paths a backup would consider, without writing anything.
+
+        Drives rsync's own dry run, so the inclusion/exclusion rules are
+        applied by exactly the code that runs a real backup.  The target is a
+        path that cannot exist: with nothing to compare against, rsync
+        reports every selected path rather than just the changed ones.  Paths
+        come back relative to their source root (``.`` is the root itself),
+        directories with a trailing ``/`` as rsync reports them.
+        """
+        errors = self._validate_sources_are_dirs(source_paths)
+        if errors:
+            # An unusable source path makes the whole listing meaningless:
+            # report it and scan nothing (same shape as the duplicity
+            # backend).  Errors from a *scan* are per-source and handled
+            # below, so one unreadable source cannot hide the others.
+            return {"sources": [], "total": 0, "errors": errors}
+
+        sources: list[dict[str, Any]] = []
+        for idx, src_str in enumerate(source_paths):
+            src = Path(src_str).expanduser().resolve()
+            include_files, exclude_files = self._source_filter_files(idx)
+            entry: dict[str, Any] = {
+                "source": str(src),
+                "include_files": include_files,
+                "exclude_files": exclude_files,
+                "paths": [],
+                "errors": [],
+            }
+            sources.append(entry)
+            if on_source is not None:
+                on_source(entry)
+
+            cmd = [self.rsync_binary, "-n", "-r", "--no-specials", "--out-format=%n"]
+            for exclude_file in self._source_exclude_files(idx):
+                cmd.append(f"--exclude-from={exclude_file}")
+            if rules := self._source_include_rules(idx):
+                cmd.extend(f"--include={rule}" for rule in rules)
+                cmd.append("--exclude=*")
+            cmd.append(f"{src}/")
+            placeholder = Path(tempfile.gettempdir()) / f"bu-dry-run-{secrets.token_hex(4)}"
+            cmd.append(str(placeholder))
+
+            # rsync walks the tree quickly, so its (much smaller) output is
+            # captured and replayed; stderr stays separate for errors.
+            result = run_streaming(cmd, silence_stdout=True, silence_stderr=True)
+            if result.returncode != 0:
+                detail = result.stderr.strip() or f"rsync exited {result.returncode}"
+                entry["errors"].append(detail)
+                errors.append(f"{src}: {detail}")
+                continue
+            for line in result.stdout.splitlines():
+                name = line.strip()
+                if not name:
+                    continue
+                if name == "./":
+                    name = "."
+                elif name.startswith("./"):
+                    name = name[2:]
+                entry["paths"].append(name)
+                if on_path is not None:
+                    on_path(name)
+
+        return {
+            "sources": sources,
+            "total": sum(len(entry["paths"]) for entry in sources),
+            "errors": errors,
+        }
 
     # ------------------------------------------------------------------
     # backup action (the only action using real rsync for now)
@@ -378,29 +460,37 @@ class RsyncMethod(Backend):
             if isinstance(p, str) and Path(p).is_file()
         ]
 
-    def _source_exclude_files(self, index: int) -> list[str]:
-        """Exclusion files for a source (per-source, else destination defaults)."""
+    def _source_exclude_filter_files(self, index: int) -> list[str]:
+        """Configured exclusion files for a source: its own, then the defaults.
+
+        Exclusions are additive — a source declaring its own ``exclude`` files
+        still gets the destination-level ones (``exclude_files``, else
+        ``exclude.txt`` + ``exclude-<name>.txt``), so the global exclusions
+        apply to every source.  The source's own files come first because
+        rsync stops at the first matching rule, so a ``+ `` exception in them
+        can override a broad default pattern.  Duplicates are dropped.
+        """
         per_source = self.config.get("_source_excludes", [])
-        if index < len(per_source) and per_source[index] is not None:
-            files = per_source[index]
-        else:
-            files = self.config.get("_exclude_files", [])
-        return [p for p in files if isinstance(p, str) and Path(p).is_file()]
+        own = per_source[index] if index < len(per_source) and per_source[index] else []
+        ordered: list[str] = []
+        for path in [*own, *self.config.get("_exclude_files", [])]:
+            if isinstance(path, str) and path not in ordered:
+                ordered.append(path)
+        return ordered
+
+    def _source_exclude_files(self, index: int) -> list[str]:
+        """Existing exclusion files for a source (missing files are skipped)."""
+        return [p for p in self._source_exclude_filter_files(index) if Path(p).is_file()]
 
     def _source_filter_files(self, index: int) -> tuple[list[str], list[str]]:
         """Return (include_files, exclude_files) as configured for a source.
 
-        A source with no per-source exclude shows the destination-level
-        ``_exclude_files`` defaults.
+        Exclusion files are the source's own followed by the destination-level
+        defaults (see ``_source_exclude_filter_files``).
         """
         includes = self.config.get("_source_includes", [])
-        excludes = self.config.get("_source_excludes", [])
         inc = list(includes[index]) if index < len(includes) else []
-        if index < len(excludes) and excludes[index] is not None:
-            exc = list(excludes[index])
-        else:
-            exc = list(self.config.get("_exclude_files", []))
-        return inc, exc
+        return inc, self._source_exclude_filter_files(index)
 
     def _source_include_rules(self, index: int) -> list[str]:
         """rsync include patterns for a source (empty when no include files)."""

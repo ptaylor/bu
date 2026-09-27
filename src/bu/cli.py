@@ -7,6 +7,7 @@ Actions:
     backup    Back up source paths to the destination
     backup-restart  Reset a failed/ongoing backup's status and start again
     backup-remove   Remove an incomplete snapshot backup directory
+    backup-dry-run  List the files the next backup would consider (no writes)
     restore   Restore files into a local directory (never deletes)
     status    Show status and last backup details
     list      List all configured destinations
@@ -28,6 +29,7 @@ import click
 
 from bu.actions import (
     action_backup,
+    action_backup_dry_run,
     action_backup_remove,
     action_backup_remove_confirmed,
     action_config,
@@ -129,6 +131,29 @@ def backup(name: str) -> None:
     click.echo(format_result(result))
 
     # Exit non-zero if there were errors
+    if result.get("errors"):
+        sys.exit(1)
+
+
+@_command("backup-dry-run")
+@_NAME_ARG
+def backup_dry_run(name: str) -> None:
+    """List the files the next backup would consider (nothing is written).
+
+    Paths stream to stdout as they are found, so they can be piped or
+    redirected; the filter files in effect, per-source progress and the totals
+    go to stderr.  Nothing is uploaded, copied or written — rsync and snapshot
+    destinations are listed with rsync's own dry run, and duplicity with
+    'backup --dry-run' at verbosity 9 against a scratch archive, so the real
+    archive is never contacted.  Every source is still scanned, which costs
+    about as much as the scan phase of a real run.
+    """
+    dest_cfg = _resolve_destination(name)
+
+    result = action_backup_dry_run(dest_cfg)
+
+    for err in result.get("errors", []):
+        click.echo(f"Error: {err}", err=True)
     if result.get("errors"):
         sys.exit(1)
 

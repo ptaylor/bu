@@ -10,7 +10,13 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any, Self
+
+try:  # POSIX only — bu targets macOS and Linux
+    import resource as _resource
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _resource = None  # type: ignore[assignment]
 
 # ANSI CSI escape sequences (e.g. colours, cursor movement) stripped from rows.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -233,6 +239,38 @@ class LiveWindow:
         sys.stdout.flush()
 
 
+#: Minimum soft open-file limit the external tools need.  duplicity 3.x
+#: aborts any full/incremental/restore run with "Max open files of N is too
+#: low, should be >= 1024" when the soft ``RLIMIT_NOFILE`` is smaller, and
+#: macOS hands 256 to processes started from Finder, launchd or cron.
+MIN_OPEN_FILE_LIMIT = 1024
+
+
+def ensure_open_file_limit(minimum: int = MIN_OPEN_FILE_LIMIT) -> bool:
+    """Raise the soft ``RLIMIT_NOFILE`` to at least ``minimum`` (best effort).
+
+    Subprocesses inherit the limit, so raising it once before spawning a
+    tool is enough.  Never lowers an existing (higher) limit, never touches
+    the hard limit, and never raises — the hard limit may simply be too low
+    for the request to be satisfiable.  Returns True when the soft limit is
+    (now) at least ``minimum``, i.e. when duplicity would accept it.
+    """
+    if _resource is None:  # pragma: no cover - non-POSIX platforms
+        return True
+    try:
+        soft, hard = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return True
+    if soft != _resource.RLIM_INFINITY and soft < minimum:
+        target = minimum if hard == _resource.RLIM_INFINITY else min(minimum, hard)
+        try:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (target, hard))
+        except (OSError, ValueError):  # pragma: no cover - hard limit too low
+            return False
+        soft = target
+    return soft == _resource.RLIM_INFINITY or soft >= minimum
+
+
 def run_streaming(
     cmd: list[str],
     env: dict[str, str] | None = None,
@@ -265,6 +303,9 @@ def run_streaming(
     if owns_window:
         window.__enter__()
     try:
+        # duplicity refuses to run below 1024 open files (macOS gives 256 to
+        # GUI/launchd processes); every child inherits whatever we set here.
+        ensure_open_file_limit()
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -308,6 +349,43 @@ def run_streaming(
             window.__exit__(None, None, None)
 
     return StreamResult(returncode, "".join(captured["stdout"]), "".join(captured["stderr"]))
+
+
+def run_filtered(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    on_line: Callable[[str], None],
+) -> int:
+    """Run a command, handing each merged output line to ``on_line``.
+
+    Returns the exit status.  Unlike ``run_streaming`` nothing is retained:
+    this suits commands whose output is *data* rather than status for the live
+    window — duplicity's verbosity-9 listing log runs to hundreds of megabytes
+    for a large source, which is far too much to buffer.
+    """
+    ensure_open_file_limit()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    stream = proc.stdout
+    try:
+        if stream is not None:
+            for raw in stream:
+                on_line(raw.rstrip("\n"))
+    finally:
+        if stream is not None:
+            stream.close()
+        if proc.poll() is None:
+            # The consumer bailed out (e.g. Ctrl-C); don't leave it running.
+            proc.terminate()
+    return proc.wait()
 
 
 class Backend(ABC):
@@ -377,6 +455,30 @@ class Backend(ABC):
         rsync would silently ignore).
         """
         return []
+
+    def list_files(
+        self,
+        source_paths: list[str],
+        *,
+        on_source: Callable[[dict[str, Any]], None] | None = None,
+        on_path: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """List the paths a backup would consider, writing nothing.
+
+        Returns ``{sources, total, errors}`` where each source entry holds
+        ``source``, the ``include_files``/``exclude_files`` in effect, the
+        selected ``paths`` and its own ``errors``.  ``on_source`` fires with
+        that entry before the source is scanned and ``on_path`` for each path
+        as it is found, so a caller can show progress instead of waiting for a
+        large scan to finish.  Backends that can drive their tool's dry run
+        override this; the default reports that the method cannot list files.
+        """
+        method = getattr(self, "METHOD_NAME", "unknown")
+        return {
+            "sources": [],
+            "total": 0,
+            "errors": [f"Listing files is not supported for the {method} method."],
+        }
 
     @abstractmethod
     def backup(

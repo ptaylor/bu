@@ -102,7 +102,7 @@ _SAMPLE_GENERIC = """\
 #       {{ path = "/path/to/backup", include = "~/.config/bu/include-name.txt", exclude = "~/.config/bu/exclude-name.txt" }},
 #   ]
 #   include = ONLY these paths are backed up (relative to the source)
-#   exclude = rsync-style exclusion file for that source (falls back to exclude_files above)
+#   exclude = rsync-style exclusion file for that source (added to exclude_files above)
 {history_file}
 {log_file}
 """
@@ -303,6 +303,48 @@ def action_backup(
     end_ts = datetime.datetime.now(datetime.timezone.utc)
     _write_backup_summary(dest, result, dry_run, elapsed=end_ts - start_ts)
 
+    return result
+
+
+def action_backup_dry_run(dest: DestinationConfig) -> dict[str, Any]:
+    """List the paths the next backup would consider (nothing is written).
+
+    The list *is* the result, so it goes to stdout — pipe it wherever you
+    like — while the per-source context, the filter files in effect and the
+    totals go to stderr, which keeps the list clean.  Like ``bu status`` this
+    is read-only: no status file, history entry or log is written, so it also
+    works while another run is in progress or after a failed one.
+    """
+    backend = _build_backend(dest)
+
+    for note in backend.preflight_notes():
+        sys.stderr.write(f"Warning: {note}\n")
+
+    def announce(entry: dict[str, Any]) -> None:
+        """Describe a source (and its filters) before it is scanned."""
+        sys.stderr.write(f"\n{entry.get('source', '?')}\n")
+        for path in entry.get("include_files", []):
+            sys.stderr.write(f"  include: {path}\n")
+        for path in entry.get("exclude_files", []):
+            sys.stderr.write(f"  exclude: {path}\n")
+        sys.stderr.write("  scanning… (this may take as long as a real scan)\n")
+        sys.stderr.flush()
+
+    def emit(path: str) -> None:
+        """Stream one selected path to stdout as it is found."""
+        sys.stdout.write(f"{path}\n")
+        sys.stdout.flush()
+
+    result = backend.list_files(dest.source_paths, on_source=announce, on_path=emit)
+
+    for entry in result.get("sources", []):
+        count = len(entry.get("paths", []))
+        sys.stderr.write(f"  {entry.get('source', '?')}: {count} path(s)\n")
+    sources = len(result.get("sources", []))
+    sys.stderr.write(
+        f"\n{result.get('total', 0)} path(s) in {sources} source(s) — nothing was written.\n"
+    )
+    sys.stderr.flush()
     return result
 
 

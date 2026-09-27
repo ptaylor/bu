@@ -24,13 +24,16 @@ import getpass
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from bu.backends.base import Backend, LiveWindow, run_streaming
+from bu.backends.base import Backend, LiveWindow, run_filtered, run_streaming
 from bu.crypto import CryptoError, decrypt_secret
 from bu.filters import read_filter_lines
 
@@ -116,6 +119,54 @@ def condense_stderr(stderr: str) -> list[str]:
             seen.add(s)
             out.append(s)
     return out
+
+
+# Lines worth surfacing when a listing dry run fails: duplicity's own
+# diagnostics (CommandLineError, BackendException) and gpg's messages.
+_ERROR_HINTS = (
+    "Error", "error", "Exception", "Fatal", "Failed", "failed", "denied", "not found",
+)
+
+
+def _looks_like_error(line: str) -> bool:
+    """True for output lines worth surfacing when a listing run fails.
+
+    ``condense_stderr`` keys off the *first* line of a block, which in a
+    verbosity-9 log is housekeeping ("Using temporary directory ...") rather
+    than the reason the run died; duplicity reports the real diagnostic
+    (CommandLineError, BackendException, gpg errors) later, so listing errors
+    are picked out by content instead.
+    """
+    return any(hint in line for hint in _ERROR_HINTS)
+
+
+def _selecting_handler(
+    entry: dict[str, Any],
+    src: Path,
+    on_path: Callable[[str], None] | None,
+    diagnostics: list[str],
+) -> Callable[[str], None]:
+    """Return a line handler that records the paths duplicity selects.
+
+    Built as a factory (rather than a closure inside the source loop) so the
+    per-source state is bound explicitly and one source's handler can never
+    see another's.
+    """
+
+    def handle(line: str) -> None:
+        if line.startswith("Selecting "):
+            selected = line[len("Selecting "):].strip()
+            if not selected:
+                return
+            path = DuplicityMethod._relative_to_source(selected, src)
+            entry["paths"].append(path)
+            if on_path is not None:
+                on_path(path)
+        elif _looks_like_error(line):
+            diagnostics.append(line.strip())
+            del diagnostics[:-5]  # keep only the last few candidates
+
+    return handle
 
 
 class DuplicityMethod(Backend):
@@ -316,29 +367,36 @@ class DuplicityMethod(Backend):
             ]
         return {"BACKEND_PASSWORD": creds[1]}, []
 
-    def _source_exclude_files(self, index: int) -> list[str]:
-        """Exclusion files for a source (per-source, else destination defaults)."""
+    def _source_exclude_filter_files(self, index: int) -> list[str]:
+        """Configured exclusion files for a source: its own, then the defaults.
+
+        Exclusions are additive — a source declaring its own ``exclude`` files
+        still gets the destination-level ones (``exclude_files``, else
+        ``exclude.txt`` + ``exclude-<name>.txt``), so the global exclusions
+        apply to every source.  The source's own files come first so their
+        patterns are translated first and win.  Duplicates are dropped.
+        """
         per_source = self.config.get("_source_excludes", [])
-        if index < len(per_source) and per_source[index] is not None:
-            files = per_source[index]
-        else:
-            files = self.config.get("_exclude_files", [])
-        return [p for p in files if isinstance(p, str) and Path(p).is_file()]
+        own = per_source[index] if index < len(per_source) and per_source[index] else []
+        ordered: list[str] = []
+        for path in [*own, *self.config.get("_exclude_files", [])]:
+            if isinstance(path, str) and path not in ordered:
+                ordered.append(path)
+        return ordered
+
+    def _source_exclude_files(self, index: int) -> list[str]:
+        """Existing exclusion files for a source (missing files are skipped)."""
+        return [p for p in self._source_exclude_filter_files(index) if Path(p).is_file()]
 
     def _source_filter_files(self, index: int) -> tuple[list[str], list[str]]:
         """Return (include_files, exclude_files) as configured for a source.
 
-        A source with no per-source exclude shows the destination-level
-        ``_exclude_files`` defaults.
+        Exclusion files are the source's own followed by the destination-level
+        defaults (see ``_source_exclude_filter_files``).
         """
         includes = self.config.get("_source_includes", [])
-        excludes = self.config.get("_source_excludes", [])
         inc = list(includes[index]) if index < len(includes) else []
-        if index < len(excludes) and excludes[index] is not None:
-            exc = list(excludes[index])
-        else:
-            exc = list(self.config.get("_exclude_files", []))
-        return inc, exc
+        return inc, self._source_exclude_filter_files(index)
 
     def _include_args(self, source: Path, index: int) -> tuple[list[str], list[str]]:
         """duplicity include args for a source plus the closing ``--exclude=**``.
@@ -433,6 +491,12 @@ class DuplicityMethod(Backend):
         errors: list[str] = []
         if proc.returncode != 0:
             errors.extend(condense_stderr(proc.stderr))
+            if any("Max open files" in e and "too low" in e for e in errors):
+                errors.append(
+                    "duplicity requires a soft open-file limit of at least 1024; "
+                    "bu raises it before running tools, so this means the hard "
+                    "limit is lower — start bu with 'ulimit -n 1024' instead."
+                )
             # Show the condensed lines in the live window (if one is active)
             if window is not None and window.active:
                 for line in errors:
@@ -483,6 +547,124 @@ class DuplicityMethod(Backend):
             return proc.stdout.split("\n")[0].strip()
         except (FileNotFoundError, OSError):
             return ""
+
+    # ------------------------------------------------------------------
+    # file listing (bu backup-dry-run)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _relative_to_source(path: str, source: Path) -> str:
+        """Spell a duplicity-reported absolute path relative to its source."""
+        root = str(source)
+        if path == root:
+            return "."
+        if path.startswith(root + os.sep):
+            return path[len(root) + 1:]
+        return path
+
+    def list_files(
+        self,
+        source_paths: list[str],
+        *,
+        on_source: Callable[[dict[str, Any]], None] | None = None,
+        on_path: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """List the paths a backup would consider, without writing anything.
+
+        duplicity has no listing mode, so this runs ``backup --dry-run`` at
+        verbosity 9 — the level at which it logs ``Selecting <path>`` for
+        every path that survived the filters.  That log is enormous (hundreds
+        of megabytes for a large source), so lines are filtered as they
+        arrive and never buffered.  duplicity is pointed at a scratch target
+        with its own archive dir: the real archive and destination are never
+        touched, no credentials are needed (and none are sent), and the
+        scratch tree is removed afterwards.  Every source is still scanned,
+        which costs about as much as the scan phase of a real run.
+        """
+        errors: list[str] = []
+        for sp in source_paths:
+            p = Path(sp).expanduser()
+            if not p.is_dir():
+                errors.append(f"Source not found: {p}")
+        if errors:
+            return {"sources": [], "total": 0, "errors": errors}
+
+        # The listing never touches the real archive: duplicity is pointed at
+        # a scratch target, so it works offline, needs no destination
+        # credentials and leaves nothing behind.  A fresh scratch archive
+        # holds no signatures to decrypt either, so the passphrase is optional
+        # here and is never prompted for.
+        passphrase = self._non_interactive_passphrase()
+
+        sources: list[dict[str, Any]] = []
+        used_subdirs: set[str] = set()
+        for idx, sp in enumerate(source_paths):
+            src = Path(sp).expanduser().resolve()
+
+            # Same per-source archive subdir the real run would use, so the
+            # selection is compared against the right archive.
+            subdir = src.name or f"src{idx}"
+            candidate = subdir
+            n = 2
+            while candidate in used_subdirs:
+                candidate = f"{subdir}_{n}"
+                n += 1
+            used_subdirs.add(candidate)
+
+            include_files, exclude_files = self._source_filter_files(idx)
+            entry: dict[str, Any] = {
+                "source": str(src),
+                "include_files": include_files,
+                "exclude_files": exclude_files,
+                "paths": [],
+                "errors": [],
+            }
+            sources.append(entry)
+            if on_source is not None:
+                on_source(entry)
+
+            scratch = Path(tempfile.mkdtemp(prefix=f"bu-list-{candidate}-"))
+            try:
+                (scratch / candidate).mkdir(parents=True, exist_ok=True)
+                include_args, include_close = self._include_args(src, idx)
+                args = [
+                    "backup",
+                    "--dry-run",
+                    "--verbosity=9",
+                    f"--archive-dir={scratch / 'archive'}",
+                ]
+                args.extend(self._exclude_args(src, self._source_exclude_files(idx)))
+                args.extend(include_args)
+                args.extend(include_close)
+                args.append(str(src))
+                # duplicity insists on a URL, not a bare directory path.
+                args.append(f"file://{scratch / candidate}")
+
+                env = dict(os.environ)
+                env["PASSPHRASE"] = passphrase or ""
+                diagnostics: list[str] = []
+
+                returncode = run_filtered(
+                    ["duplicity", *args],
+                    env=env,
+                    on_line=_selecting_handler(entry, src, on_path, diagnostics),
+                )
+                if returncode != 0:
+                    detail = diagnostics[-1] if diagnostics else f"duplicity exited {returncode}"
+                    entry["errors"].append(detail)
+                    errors.append(f"{src}: {detail}")
+            except FileNotFoundError:
+                detail = "duplicity binary not found. Is it installed?"
+                entry["errors"].append(detail)
+                errors.append(detail)
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+
+        return {
+            "sources": sources,
+            "total": sum(len(entry["paths"]) for entry in sources),
+            "errors": errors,
+        }
 
     # ------------------------------------------------------------------
     # Backend interface
