@@ -176,6 +176,135 @@ class SnapshotMethod(RsyncMethod):
         return {"ok": True, "removed": info["dir"], "snapshot": info["snapshot"]}
 
     # ------------------------------------------------------------------
+    # prune (retention plan)
+    # ------------------------------------------------------------------
+
+    # Retention ranges, in whole UTC calendar days of age.  Hard-coded on
+    # purpose: the policy describes the tool, not an individual destination.
+    PRUNE_DAILY_MAX_AGE = 7
+    PRUNE_WEEKLY_MAX_AGE = 31
+    PRUNE_MONTHLY_MAX_AGE = 365
+
+    @staticmethod
+    def prune_policy() -> list[str]:
+        """The retention policy, one human-readable line per rule."""
+        return [
+            "all snapshots from today",
+            "one per day for the last 7 days",
+            "one per week for the last month",
+            "one per month for the last year",
+            "one per year before that",
+        ]
+
+    @staticmethod
+    def _snapshot_datetime(name: str) -> datetime.datetime | None:
+        """Parse a snapshot directory name as a UTC datetime, or None."""
+        try:
+            parsed = datetime.datetime.strptime(
+                name[:19], "%Y-%m-%d-%H.%M.%S",
+            ).replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            return None
+        return parsed
+
+    @classmethod
+    def _bucket_for(
+        cls,
+        ts: datetime.datetime,
+        now: datetime.datetime,
+    ) -> tuple[str, str, str]:
+        """Return ``(kind, key, label)`` for a snapshot's age.
+
+        Calendar-based and in UTC, so a snapshot's bucket always agrees with the
+        directory name it was given.
+        """
+        age = (now.date() - ts.date()).days
+        if age <= 0:
+            # A future-dated snapshot (clock skew) is treated as today rather
+            # than being pruned for being "too new".
+            return "today", "today", "today"
+        if age <= cls.PRUNE_DAILY_MAX_AGE:
+            return "daily", ts.strftime("%Y-%m-%d"), f"day {ts:%Y-%m-%d}"
+        if age <= cls.PRUNE_WEEKLY_MAX_AGE:
+            iso = ts.isocalendar()
+            label = f"week {iso.year}-W{iso.week:02d}"
+            return "weekly", label, label
+        if age <= cls.PRUNE_MONTHLY_MAX_AGE:
+            return "monthly", ts.strftime("%Y-%m"), f"month {ts:%Y-%m}"
+        return "yearly", ts.strftime("%Y"), f"year {ts:%Y}"
+
+    def prune_plan(self, now: datetime.datetime | None = None) -> dict[str, Any]:
+        """Work out which snapshots the retention policy would remove.
+
+        Read-only: nothing is deleted and nothing is written.  Snapshots are
+        walked newest first and the first one seen in each bucket is kept, so
+        every bucket retains its newest member and today's bucket keeps every
+        snapshot.  The directory named by the status file — an interrupted or
+        failed run — is never a candidate; ``bu backup-remove`` owns that case.
+        ``now`` is injectable so tests need not patch the clock.
+        """
+        if now is None:
+            now = datetime.datetime.now(datetime.timezone.utc)
+        elif now.tzinfo is None:
+            now = now.replace(tzinfo=datetime.timezone.utc)
+
+        dest_dir = self._dest_dir()
+        snapshots = self._list_snapshots()
+        status = self.read_status()
+        protected: str | None = None
+        if status.get("state") != "completed":
+            candidate = status.get("snapshot")
+            if isinstance(candidate, str) and self.SNAPSHOT_RE.match(candidate):
+                protected = candidate
+
+        keep: list[dict[str, Any]] = []
+        remove: list[dict[str, Any]] = []
+        holders: dict[tuple[str, str], str] = {}
+        for path in reversed(snapshots):  # newest first
+            ts = self._snapshot_datetime(path.name)
+            if ts is None:  # pragma: no cover - SNAPSHOT_RE already filtered
+                continue
+            kind, key, label = self._bucket_for(ts, now)
+            if path.name == protected:
+                holders[(kind, key)] = path.name
+                keep.append({
+                    "name": path.name,
+                    "bucket": label,
+                    "reason": "last run did not complete — 'bu backup-remove' clears it",
+                })
+            elif kind == "today":
+                keep.append({"name": path.name, "bucket": label, "reason": "today"})
+            elif (kind, key) in holders:
+                holder = holders[(kind, key)]
+                remove.append({
+                    "name": path.name,
+                    "bucket": label,
+                    "superseded_by": holder,
+                    "reason": f"superseded by {holder} ({label})",
+                })
+            else:
+                holders[(kind, key)] = path.name
+                keep.append({
+                    "name": path.name,
+                    "bucket": label,
+                    "reason": f"newest of {label}",
+                })
+
+        keep.reverse()  # oldest first, like `bu status` lists snapshots
+        remove.reverse()
+        return {
+            "ok": True,
+            "destination": str(dest_dir),
+            "dest_exists": dest_dir.is_dir(),
+            "snapshots": len(snapshots),
+            "policy": self.prune_policy(),
+            "keep": keep,
+            "remove": remove,
+            "protected": protected,
+            "errors": [],
+        }
+
+    # ------------------------------------------------------------------
     # hard-link support check
     # ------------------------------------------------------------------
 

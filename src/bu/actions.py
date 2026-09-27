@@ -451,6 +451,35 @@ def action_restore_test(dest: DestinationConfig) -> dict[str, Any]:
     return result
 
 
+def action_prune(dest: DestinationConfig) -> dict[str, Any]:
+    """List the snapshots a retention policy would remove (nothing is deleted).
+
+    Read-only by design, mirroring how ``action_backup_remove`` describes before
+    anything is removed: no status file, history entry or log is written, and
+    the source trees are never touched.
+    """
+    if dest.method != "snapshot":
+        return {
+            "ok": False,
+            "keep": [],
+            "remove": [],
+            "errors": [
+                (
+                    f"prune only applies to snapshot destinations "
+                    f"({dest.name!r} uses {dest.method})"
+                )
+            ],
+        }
+
+    result = _build_backend(dest).prune_plan()
+    if not result.get("dest_exists"):
+        result["ok"] = False
+        result["errors"] = [
+            f"Destination not found: {result.get('destination')} — is the disk mounted?"
+        ]
+    return result
+
+
 def _write_raw_log(
     dest: DestinationConfig,
     action: str,
@@ -1140,6 +1169,41 @@ def format_restore_test(result: dict[str, Any], json_output: bool = False) -> st
         )
         for err in result.get("errors", []):
             lines.append(f"  - {err}")
+    return "\n".join(lines)
+
+
+def format_prune(result: dict[str, Any], json_output: bool = False) -> str:
+    """Format a prune plan for display."""
+    if json_output:
+        return json.dumps(result, indent=2, default=str)
+
+    if not result.get("ok"):
+        errors = result.get("errors") or ["unknown error"]
+        return "\n".join(f"Error: {err}" for err in errors)
+
+    keep = result.get("keep", [])
+    remove = result.get("remove", [])
+
+    lines: list[str] = ["Policy"]
+    lines.extend(f"  {rule}" for rule in result.get("policy", []))
+
+    lines.append("")
+    lines.append(f"Keep ({len(keep)})")
+    for entry in keep:
+        lines.append(f"  {entry['name']:<23}{entry.get('reason', '')}")
+
+    lines.append("")
+    lines.append(f"Remove ({len(remove)})")
+    if not remove:
+        lines.append("  (nothing — every snapshot is still within the policy)")
+    for entry in remove:
+        lines.append(f"  {entry['name']:<23}{entry.get('reason', '')}")
+
+    lines.append("")
+    lines.append(
+        f"{len(remove)} of {result.get('snapshots', 0)} snapshot(s) would be "
+        "removed — nothing was deleted (listing only)."
+    )
     return "\n".join(lines)
 
 

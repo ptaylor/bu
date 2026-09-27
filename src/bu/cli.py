@@ -10,6 +10,7 @@ Actions:
     backup-dry-run  List the files the next backup would consider (no writes)
     restore   Restore files into a local directory (never deletes)
     restore-test  Restore the last backup's marker files and verify them
+    prune     List the snapshots a retention policy would remove (no deletes)
     status    Show status and last backup details
     list      List all configured destinations
     config    Edit a destination configuration in $EDITOR
@@ -36,10 +37,12 @@ from bu.actions import (
     action_config,
     action_history,
     action_log,
+    action_prune,
     action_restore,
     action_restore_test,
     action_status,
     format_history,
+    format_prune,
     format_restore_test,
     format_result,
     format_status,
@@ -252,16 +255,6 @@ def restore(
         sys.exit(1)
 
 
-@_command()
-@_NAME_ARG
-def status(name: str) -> None:
-    """Show status of the backup for NAME."""
-    dest_cfg = _resolve_destination(name)
-
-    result = action_status(dest_cfg)
-    click.echo(format_status(result))
-
-
 @_command("restore-test")
 @_NAME_ARG
 def restore_test(name: str) -> None:
@@ -283,6 +276,40 @@ def restore_test(name: str) -> None:
 
     if not result.get("ok"):
         sys.exit(1)
+
+
+@_command("prune")
+@_NAME_ARG
+def prune(name: str) -> None:
+    """List the snapshots a retention policy would remove (snapshot only).
+
+    The plan keeps every snapshot from today, one per day for the last 7 days,
+    one per week for the last month, one per month for the last year, and one
+    per year before that. The newest snapshot of each period wins, and the
+    directory an interrupted run is using is never a candidate.
+
+    This version only lists: nothing is deleted, and no status file, history
+    entry or log is written.
+    """
+    dest_cfg = _resolve_destination(name)
+
+    result = action_prune(dest_cfg)
+    if not result.get("ok"):
+        for err in result.get("errors") or ["unknown error"]:
+            click.echo(f"Error: {err}", err=True)
+        sys.exit(1)
+
+    click.echo(format_prune(result))
+
+
+@_command()
+@_NAME_ARG
+def status(name: str) -> None:
+    """Show status of the backup for NAME."""
+    dest_cfg = _resolve_destination(name)
+
+    result = action_status(dest_cfg)
+    click.echo(format_status(result))
 
 
 @_command("list")
