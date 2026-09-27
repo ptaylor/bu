@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -1172,8 +1173,34 @@ def format_restore_test(result: dict[str, Any], json_output: bool = False) -> st
     return "\n".join(lines)
 
 
-def format_prune(result: dict[str, Any], json_output: bool = False) -> str:
-    """Format a prune plan for display."""
+# ANSI styling for the formatters — only applied when stdout is a terminal.
+_ANSI_STYLES: dict[str, str] = {
+    "reset": "\033[0m",
+    "keep": "\033[1;32m",    # bold green: a snapshot the policy keeps
+    "drop": "\033[2m",       # dim: a removal candidate
+}
+
+
+def _paint(text: str, style: str, colour: bool) -> str:
+    """Wrap ``text`` in an ANSI style when colour output is enabled."""
+    if not colour:
+        return text
+    return f"{_ANSI_STYLES[style]}{text}{_ANSI_STYLES['reset']}"
+
+
+def format_prune(
+    result: dict[str, Any],
+    json_output: bool = False,
+    colour: bool | None = None,
+) -> str:
+    """Format a prune plan for display.
+
+    One chronological line per snapshot, newest first: the snapshots the policy
+    keeps are highlighted and the removal candidates are dimmed, so the shape of
+    the policy is visible at a glance.  Colours are dropped when stdout is not a
+    terminal, so pipes, logs and tests see plain text; the ✓ / - glyphs carry
+    the same meaning either way.  ``colour`` overrides that decision.
+    """
     if json_output:
         return json.dumps(result, indent=2, default=str)
 
@@ -1181,30 +1208,48 @@ def format_prune(result: dict[str, Any], json_output: bool = False) -> str:
         errors = result.get("errors") or ["unknown error"]
         return "\n".join(f"Error: {err}" for err in errors)
 
+    if colour is None:
+        colour = sys.stdout.isatty()
     keep = result.get("keep", [])
     remove = result.get("remove", [])
+    entries = sorted(
+        [{**entry, "keep": True} for entry in keep]
+        + [{**entry, "keep": False} for entry in remove],
+        key=lambda entry: entry["name"],
+        reverse=True,
+    )
 
-    lines: list[str] = ["Policy"]
-    lines.extend(f"  {rule}" for rule in result.get("policy", []))
-
-    lines.append("")
-    lines.append(f"Keep ({len(keep)})")
-    for entry in keep:
-        lines.append(f"  {entry['name']:<23}{entry.get('reason', '')}")
-
-    lines.append("")
-    lines.append(f"Remove ({len(remove)})")
-    if not remove:
-        lines.append("  (nothing — every snapshot is still within the policy)")
-    for entry in remove:
-        lines.append(f"  {entry['name']:<23}{entry.get('reason', '')}")
+    lines = [
+        f"Prune plan — {result.get('name', '?')} ({len(entries)} snapshot(s))",
+        *_policy_lines(result),
+        "",
+    ]
+    for entry in entries:
+        style = "keep" if entry["keep"] else "drop"
+        marker = _paint("✓" if entry["keep"] else "-", style, colour)
+        label = _paint(f"{entry['name']:<21}", style, colour)
+        lines.append(f"  {marker} {label} {entry.get('reason', '')}")
 
     lines.append("")
     lines.append(
-        f"{len(remove)} of {result.get('snapshots', 0)} snapshot(s) would be "
-        "removed — nothing was deleted (listing only)."
+        f"{len(keep)} kept, {len(remove)} would be removed — "
+        "nothing was deleted (listing only)."
     )
+    if result.get("protected"):
+        lines.append(
+            "The snapshot marked 'last run did not complete' belongs to an "
+            "unfinished run — 'bu backup-remove' clears that directory."
+        )
     return "\n".join(lines)
+
+
+def _policy_lines(result: dict[str, Any], width: int = 78) -> list[str]:
+    """Wrap the retention policy into an indented paragraph."""
+    policy = result.get("policy") or []
+    if not policy:
+        return []
+    text = "Retention: " + "; ".join(policy) + "."
+    return textwrap.wrap(text, width=width, subsequent_indent=" " * len("Retention: "))
 
 
 def format_status(result: dict[str, Any], json_output: bool = False) -> str:

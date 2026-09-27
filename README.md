@@ -247,22 +247,25 @@ remove. It applies to **snapshot** destinations only — other methods say so an
 exit — and in this version it **lists the plan and deletes nothing**:
 
 ```
-Policy
-  all snapshots from today
-  one per day for the last 7 days
-  one per week for the last month
-  one per month for the last year
-  one per year before that
+Prune plan — orange (15 snapshot(s))
+Retention: all snapshots from today; one per day for the last 7 days; one per
+           week for the last month; one per month for the last year; one per
+           year before that.
 
-Keep (10)
-  2022-12-03-15.52.04    newest of year 2022
-  ...
-Remove (5)
-  2022-08-28-17.21.22    superseded by 2022-12-03-15.52.04 (year 2022)
-  ...
+  ✓ 2026-09-27-18.04.56   today
+  ✓ 2026-07-31-19.14.31   newest of month 2026-07
+  ✓ 2025-08-20-19.34.49   newest of year 2025
+  ✓ 2022-12-03-15.52.04   newest of year 2022
+  - 2022-09-07-20.00.52   superseded by 2022-12-03-15.52.04 (year 2022)
+  - 2022-08-28-17.21.22   superseded by 2022-12-03-15.52.04 (year 2022)
 
-5 of 15 snapshot(s) would be removed — nothing was deleted (listing only).
+10 kept, 5 would be removed — nothing was deleted (listing only).
 ```
+
+One line per snapshot, newest first: kept snapshots are highlighted and the
+removal candidates are dimmed. Colour is dropped automatically when the output
+is not a terminal (piped, redirected, logged), where the `✓` and `-` markers
+carry the same meaning.
 
 The policy is fixed, and measured in whole UTC calendar days so it always
 agrees with the snapshot directory names:

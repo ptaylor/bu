@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
+import types
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
+from bu import actions
 from bu.actions import action_prune, format_prune
 from bu.backends.snapshot import SnapshotMethod
 from bu.cli import main
@@ -181,6 +184,27 @@ def test_plan_writes_nothing(env: Path) -> None:
     assert not (env / "logs").exists()
 
 
+def test_format_prune_colours_by_default_on_a_tty(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Colour is the default on a terminal and off everywhere else."""
+    _src, dest, method = setup_dest(env)
+    snapshot(dest, ago(45))
+    plan = method.prune_plan(now=NOW)
+
+    monkeypatch.setattr(
+        actions, "sys",
+        types.SimpleNamespace(stdout=types.SimpleNamespace(isatty=lambda: True)),
+    )
+    assert "\033[" in format_prune(plan)
+
+    monkeypatch.setattr(
+        actions, "sys",
+        types.SimpleNamespace(stdout=types.SimpleNamespace(isatty=lambda: False)),
+    )
+    assert "\033[" not in format_prune(plan)
+
+
 def test_same_second_suffix_keeps_the_later_name(env: Path) -> None:
     _src, dest, method = setup_dest(env)
     when = ago(45)
@@ -207,7 +231,10 @@ def test_incomplete_run_directory_is_never_a_candidate(env: Path) -> None:
     assert old in names(plan["keep"])
     assert old not in names(plan["remove"])
     reason = next(e["reason"] for e in plan["keep"] if e["name"] == old)
-    assert "did not complete" in reason and "backup-remove" in reason
+    assert "did not complete" in reason
+    # The remedy is explained once, under the list.
+    assert "bu backup-remove" in format_prune(plan, colour=False)
+    assert plan["protected"] == old
 
 
 def test_completed_status_protects_nothing_extra(env: Path) -> None:
@@ -266,17 +293,40 @@ def test_non_snapshot_method_reports_clearly(env: Path) -> None:
     assert "Error:" in format_prune(result)
 
 
-def test_format_prune_shows_both_sections(env: Path) -> None:
+def test_format_prune_lists_every_snapshot_newest_first(env: Path) -> None:
+    _src, dest, method = setup_dest(env)
+    dropped = snapshot(dest, ago(45))
+    kept = snapshot(dest, ago(40))
+
+    output = format_prune(method.prune_plan(now=NOW), colour=False)
+    lines = output.splitlines()
+
+    assert lines[0] == "Prune plan — test (2 snapshot(s))"
+    assert lines[1].startswith("Retention: all snapshots from today")
+    # One line per snapshot, newest first, ✓ for kept and - for candidates.
+    assert f"  ✓ {kept}" in output
+    assert f"  - {dropped}" in output
+    assert f"  - {kept}" not in output
+    assert f"  ✓ {dropped}" not in output
+    assert output.index(kept) < output.index(dropped)
+    assert "1 kept, 1 would be removed — nothing was deleted (listing only)." in output
+    assert "·" not in output.split("Retention")[1].split("\n\n")[0]
+
+
+def test_format_prune_colours_only_when_asked(env: Path) -> None:
     _src, dest, method = setup_dest(env)
     snapshot(dest, ago(45))
     snapshot(dest, ago(40))
+    plan = method.prune_plan(now=NOW)
 
-    output = format_prune(method.prune_plan(now=NOW))
+    plain = format_prune(plan, colour=False)
+    coloured = format_prune(plan, colour=True)
 
-    assert "Keep (1)" in output
-    assert "Remove (1)" in output
-    assert "1 of 2 snapshot(s) would be removed" in output
-    assert "nothing was deleted" in output
+    assert "\033[" not in plain
+    assert "\033[1;32m" in coloured      # kept snapshots: bold green
+    assert "\033[2m" in coloured         # removal candidates: dim
+    # Colour is purely additive: stripping it gives the plain rendering back.
+    assert re.sub(r"\033\[[0-9;]*m", "", coloured) == plain
 
 
 def test_cli_lists_the_plan_without_deleting(env: Path) -> None:
@@ -284,8 +334,8 @@ def test_cli_lists_the_plan_without_deleting(env: Path) -> None:
     src.mkdir()
     dest = env / "dest"
     dest.mkdir()
-    snapshot(dest, NOW - datetime.timedelta(days=45))
-    snapshot(dest, NOW - datetime.timedelta(days=40))
+    dropped = snapshot(dest, NOW - datetime.timedelta(days=45))
+    kept = snapshot(dest, NOW - datetime.timedelta(days=40))
     cfg_dir = env / "config"
     cfg_dir.mkdir()
     (cfg_dir / "t.toml").write_text(
@@ -298,8 +348,11 @@ def test_cli_lists_the_plan_without_deleting(env: Path) -> None:
     result = CliRunner().invoke(main, ["prune", "t"])
 
     assert result.exit_code == 0, result.output
-    assert "Keep (1)" in result.output
-    assert "Remove (1)" in result.output
+    # CliRunner captures stdout, so this is the no-colour rendering.
+    assert "\033[" not in result.output
+    assert f"  ✓ {kept}" in result.output
+    assert f"  - {dropped}" in result.output
+    assert "1 kept, 1 would be removed" in result.output
     assert "nothing was deleted" in result.output
     # The CLI really is the read-only half.
     assert sorted(p.name for p in dest.iterdir()) == before

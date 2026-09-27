@@ -270,7 +270,7 @@ class SnapshotMethod(RsyncMethod):
                 keep.append({
                     "name": path.name,
                     "bucket": label,
-                    "reason": "last run did not complete — 'bu backup-remove' clears it",
+                    "reason": f"{label} · last run did not complete",
                 })
             elif kind == "today":
                 keep.append({"name": path.name, "bucket": label, "reason": "today"})
@@ -294,6 +294,7 @@ class SnapshotMethod(RsyncMethod):
         remove.reverse()
         return {
             "ok": True,
+            "name": self.config.get("_name", "unknown"),
             "destination": str(dest_dir),
             "dest_exists": dest_dir.is_dir(),
             "snapshots": len(snapshots),
