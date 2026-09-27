@@ -9,6 +9,7 @@ Actions:
     backup-remove   Remove an incomplete snapshot backup directory
     backup-dry-run  List the files the next backup would consider (no writes)
     restore   Restore files into a local directory (never deletes)
+    restore-test  Restore the last backup's marker files and verify them
     status    Show status and last backup details
     list      List all configured destinations
     config    Edit a destination configuration in $EDITOR
@@ -36,8 +37,10 @@ from bu.actions import (
     action_history,
     action_log,
     action_restore,
+    action_restore_test,
     action_status,
     format_history,
+    format_restore_test,
     format_result,
     format_status,
 )
@@ -257,6 +260,29 @@ def status(name: str) -> None:
 
     result = action_status(dest_cfg)
     click.echo(format_status(result))
+
+
+@_command("restore-test")
+@_NAME_ARG
+def restore_test(name: str) -> None:
+    """Check that NAME's newest backup can actually be restored.
+
+    Before every backup bu appends a run identifier to
+    'backup-status-<name>.txt' in each configured restore_test_dirs directory.
+    This restores those files from the newest backup into a temporary
+    directory and checks their newest entry names the run that just completed,
+    so a pass proves the data is both present and readable. Read-only: the
+    destination and the source trees are never modified, and the temporary
+    directory is always removed. Refuses while the last backup is not
+    completed.
+    """
+    dest_cfg = _resolve_destination(name)
+
+    result = action_restore_test(dest_cfg)
+    click.echo(format_restore_test(result))
+
+    if not result.get("ok"):
+        sys.exit(1)
 
 
 @_command("list")

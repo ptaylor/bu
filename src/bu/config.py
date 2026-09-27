@@ -56,7 +56,15 @@ def _normalise_file_list(value: Any, key: str) -> list[str] | None:
 
 
 # Keys that are handled specially and NOT passed through to backend ``extra``.
-_RESERVED_KEYS = frozenset({"method", "source_paths", "destination", "history_file", "log_file", "exclude_files"})
+_RESERVED_KEYS = frozenset({
+    "method",
+    "source_paths",
+    "destination",
+    "history_file",
+    "log_file",
+    "exclude_files",
+    "restore_test_dirs",
+})
 
 # Valid method names.
 _VALID_METHODS = frozenset({"rsync", "duplicity", "snapshot"})
@@ -100,6 +108,9 @@ class DestinationConfig:
         self._history_file_override: str | None = data.get("history_file")
         self._log_file_override: str | None = data.get("log_file")
         self._exclude_files_override: list[str] | None = data.get("exclude_files")
+        self._restore_test_dirs: list[str] = (
+            _normalise_file_list(data.get("restore_test_dirs"), "restore_test_dirs") or []
+        )
 
         # source_paths entries are plain strings or tables with optional
         # per-source ``include`` / ``exclude`` filter files.
@@ -186,6 +197,16 @@ class DestinationConfig:
             cfg_dir / "exclude.txt",
             cfg_dir / f"exclude-{self.name}.txt",
         ]
+
+    @property
+    def restore_test_dirs(self) -> list[Path]:
+        """Return the configured restore-test directories.
+
+        Optional; declared as absolute paths inside the source trees which
+        receive a per-run marker file (``backup-status-<name>.txt``) before
+        each backup, so ``bu restore-test`` can prove the backup is readable.
+        """
+        return [Path(p).expanduser() for p in self._restore_test_dirs]
 
     @property
     def per_source_include_files(self) -> list[list[Path]]:

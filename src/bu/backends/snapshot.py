@@ -238,6 +238,11 @@ class SnapshotMethod(RsyncMethod):
             ts = resume
         snap_dir = self._dest_dir() / ts
 
+        # The snapshot directory name is this run's id, so a marker inside the
+        # snapshot always names the snapshot it was written for.
+        run_id = ts
+        markers, _ = self.resolve_restore_markers(source_paths)
+
         if not dry_run:
             if self._hardlink_check_needed():
                 link_errors = self._check_hardlink_support()
@@ -246,7 +251,7 @@ class SnapshotMethod(RsyncMethod):
                             "errors": link_errors}
             # Record the snapshot timestamp from the very start so an
             # interrupted run can be resumed into the SAME directory.
-            self._write_status("started", snapshot=ts)
+            self._write_status("started", snapshot=ts, run_id=run_id)
             snap_dir.mkdir(parents=True, exist_ok=True)
 
         total_files = 0
@@ -283,6 +288,10 @@ class SnapshotMethod(RsyncMethod):
                     link_dest = str(latest / candidate)
 
                 window.set_context(str(src))
+                if not dry_run:
+                    all_errors.extend(self.write_restore_markers(
+                        [m for m in markers if m["index"] == idx], run_id,
+                    ))
                 include_rules = self._source_include_rules(idx)
                 result = self._rsync_one(
                     src,
@@ -302,10 +311,13 @@ class SnapshotMethod(RsyncMethod):
             window.__exit__(None, None, None)
 
         if not dry_run:
+            record = self.restore_test_record(markers, run_id)
             if all_errors:
                 self._write_status(
                     "error",
                     snapshot=ts,
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                     errors=all_errors,
@@ -314,6 +326,8 @@ class SnapshotMethod(RsyncMethod):
                 self._write_status(
                     "completed",
                     snapshot=ts,
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                 )
@@ -333,6 +347,20 @@ class SnapshotMethod(RsyncMethod):
     # ------------------------------------------------------------------
     # restore action
     # ------------------------------------------------------------------
+
+    def _restore_test_backup_path(
+        self, entry: dict[str, Any], status: dict[str, Any],
+    ) -> str:
+        """Prefix the marker path with the snapshot it was recorded for.
+
+        A leading timestamp component makes ``restore`` read that exact
+        snapshot rather than whatever happens to be newest.
+        """
+        inner = super()._restore_test_backup_path(entry, status)
+        ts = status.get("snapshot")
+        if isinstance(ts, str) and self.SNAPSHOT_RE.match(ts):
+            return f"{ts}/{inner}"
+        return inner
 
     def restore(
         self,
@@ -387,6 +415,7 @@ class SnapshotMethod(RsyncMethod):
                     "errors": [f"Backup path not found: {src}"]}
 
         # One live window for the restore run, with the target on the status line
+        quiet = bool(extra_args and extra_args.get("quiet"))
         window = LiveWindow(
             scroll_lines,
             title=f"Restore output — {self.config.get('_name', '?')}",
@@ -400,6 +429,7 @@ class SnapshotMethod(RsyncMethod):
                 dry_run,
                 delete=False,
                 window=window,
+                quiet=quiet,
             )
         finally:
             window.__exit__(None, None, None)
@@ -436,6 +466,7 @@ class SnapshotMethod(RsyncMethod):
             "dest_path": str(dest_dir),
             "dest_exists": dest_dir.is_dir(),
             "exclude_files": list(self.config.get("_exclude_files", [])),
+            "restore_test_dirs": self.restore_test_dirs(),
         }
 
         sources_status: list[dict[str, Any]] = []
@@ -464,4 +495,5 @@ class SnapshotMethod(RsyncMethod):
         else:
             result["last_backup"] = None
 
+        result["notes"] = self.restore_test_notes()
         return result

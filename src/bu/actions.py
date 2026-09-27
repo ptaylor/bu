@@ -34,6 +34,13 @@ source_paths = [
     "~/notes",
 ]
 destination = "/mnt/backup/docs"
+# Optional: directories (inside the sources) that receive a marker file before
+# every backup, so 'bu restore-test' can prove the backup is readable.
+# 'bu create' fills this in with the root of each source.
+# restore_test_dirs = [
+#     "~/Documents",
+#     "~/notes",
+# ]
 # exclude_files = [
 #     "~/.config/bu/exclude.txt",
 #     "~/.config/bu/exclude-docs.txt",
@@ -50,6 +57,13 @@ source_paths = [
     "~/notes",
 ]
 destination = "/mnt/backup/docs"            # or "b2://bucket-name/path"
+# Optional: directories (inside the sources) that receive a marker file before
+# every backup, so 'bu restore-test' can prove the backup is readable.
+# 'bu create' fills this in with the root of each source.
+# restore_test_dirs = [
+#     "~/Documents",
+#     "~/notes",
+# ]
 # passphrase_file = "~/.config/bu/secrets/docs.pass"   # optional: first line holds the passphrase
 # full_if_older_than = "30D"                           # optional: full backup cadence
 # verbosity = 6                                        # optional: 0-9 (default 6 on TTY, 4 piped)
@@ -74,6 +88,13 @@ source_paths = [
     "~/notes",
 ]
 destination = "/mnt/backup/docs"
+# Optional: directories (inside the sources) that receive a marker file before
+# every backup, so 'bu restore-test' can prove the backup is readable.
+# 'bu create' fills this in with the root of each source.
+# restore_test_dirs = [
+#     "~/Documents",
+#     "~/notes",
+# ]
 # Each backup creates a new "<destination>/<YYYY-MM-DD-HH.MM.SS>/" snapshot (UTC);
 # unchanged files are hard-linked from the previous snapshot (rsync --link-dest).
 # The destination filesystem must support hard links.
@@ -92,6 +113,12 @@ _SAMPLE_GENERIC = """\
 #     "/path/to/backup",
 # ]
 # destination = "/path/to/backup/location"
+# Optional: directories (inside the sources) that receive a marker file before
+# every backup, so 'bu restore-test' can prove the backup is readable.
+# 'bu create' fills this in with the root of each source.
+# restore_test_dirs = [
+#     "/path/to/backup",
+# ]
 # exclude_files = [
 #     "~/.config/bu/exclude.txt",
 #     "~/.config/bu/exclude-name.txt",
@@ -124,6 +151,7 @@ def _build_backend(dest: DestinationConfig) -> Any:
         None if lst is None else [str(p) for p in lst]
         for lst in dest.per_source_exclude_files
     ]
+    config["_restore_test_dirs"] = [str(p) for p in dest.restore_test_dirs]
     return backend_cls(config)
 
 
@@ -376,6 +404,51 @@ def action_backup_remove_confirmed(dest: DestinationConfig) -> dict[str, Any]:
     """Perform the removal after the user has confirmed it."""
     backend = _build_backend(dest)
     return backend.remove_incomplete_snapshot()
+
+
+def action_restore_test(dest: DestinationConfig) -> dict[str, Any]:
+    """Restore the last run's marker files and verify their newest entry.
+
+    A read-only end-to-end check: the marker files written before the last
+    backup are restored into a temporary directory and their newest entry must
+    name the run that just completed — so the files really are inside the
+    backup and hold fresh data.  The temporary directory is always removed.
+    """
+    backend = _build_backend(dest)
+
+    # Only a completed backup is worth verifying; a running or failed run
+    # leaves the destination in an unknown state.
+    if reason := backend.backup_block_reason():
+        return {
+            "ok": False,
+            "checked": 0,
+            "passed": 0,
+            "failed": 0,
+            "results": [],
+            "errors": [reason, "Restore test is blocked until the backup completes."],
+        }
+
+    start_ts = datetime.datetime.now(datetime.timezone.utc)
+
+    logger = ActionLogger(dest.history_file)
+    logger.start("restore-test", dest.name)
+
+    _write_action_header(dest, "restore-test", start_ts)
+    _touch_log_start(dest, "restore-test", start_ts)
+
+    result = backend.restore_test()
+
+    for err in result.get("errors", []):
+        logger.error(str(err))
+
+    logger.end(
+        files_restored=result.get("passed", 0),
+        markers_checked=result.get("checked", 0),
+    )
+
+    _write_raw_log(dest, "restore-test", start_ts, result)
+
+    return result
 
 
 def _write_raw_log(
@@ -1028,6 +1101,46 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
     return "\n".join(lines)
 
 
+def format_restore_test(result: dict[str, Any], json_output: bool = False) -> str:
+    """Format a restore-test result for display."""
+    if json_output:
+        return json.dumps(result, indent=2, default=str)
+
+    lines: list[str] = []
+    expected = result.get("expected") or "?"
+    lines.append(f"Restore test : run {expected}")
+
+    for entry in result.get("results", []):
+        icon = "✓" if entry.get("ok") else "✗"
+        lines.append(f"  {icon} {entry.get('dir', '?')}")
+        lines.append(f"      in backup : {entry.get('backup_path', '?')}")
+        if entry.get("ok"):
+            lines.append(f"      newest entry: {entry.get('actual')}")
+        elif entry.get("error"):
+            lines.append(f"      {entry['error']}")
+
+    checked = result.get("checked", 0)
+    passed = result.get("passed", 0)
+    lines.append("")
+    if result.get("ok"):
+        if checked:
+            lines.append(
+                f"✓ {passed} of {checked} marker(s) verified — the newest backup is restorable."
+            )
+        else:
+            lines.append("No restore-test markers were checked.")
+            for note in result.get("errors", []):
+                lines.append(f"  ℹ {note}")
+    else:
+        lines.append(
+            f"✗ {passed} of {checked} marker(s) verified — the newest backup is NOT "
+            "fully restorable."
+        )
+        for err in result.get("errors", []):
+            lines.append(f"  - {err}")
+    return "\n".join(lines)
+
+
 def format_status(result: dict[str, Any], json_output: bool = False) -> str:
     """Format status results for display."""
     if json_output:
@@ -1068,6 +1181,12 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
         for f in exclude_files:
             missing = "" if Path(f).expanduser().is_file() else " (missing)"
             lines.append(f"  {f}{missing}")
+
+    restore_dirs = result.get("restore_test_dirs")
+    if restore_dirs:
+        lines.append("Restore test :")
+        for f in restore_dirs:
+            lines.append(f"  {f}")
 
     for note in result.get("notes") or []:
         lines.append(f"ℹ {note}")

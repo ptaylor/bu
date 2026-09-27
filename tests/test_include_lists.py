@@ -348,7 +348,11 @@ def test_duplicity_include_and_exclude_args(env: Path) -> None:
     })
 
     prefix, close = m._include_args(Path("/Users/paul"), 0)
+    # The restore-test marker is allowed through first: the closing
+    # --exclude=** would otherwise drop a marker at the source root, which is
+    # never in anybody's include file.
     assert prefix == [
+        "--include=/Users/paul/backup-status-test.txt",
         "--include=/Users/paul/docs",
         "--include=/Users/paul/code/proj",
     ]

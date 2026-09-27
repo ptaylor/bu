@@ -35,7 +35,7 @@ from urllib.parse import quote
 
 from bu.backends.base import Backend, LiveWindow, run_filtered, run_streaming
 from bu.crypto import CryptoError, decrypt_secret
-from bu.filters import read_filter_lines
+from bu.filters import marker_filename, read_filter_lines
 
 
 def translate_exclude_line(line: str) -> tuple[bool, str] | None:
@@ -404,7 +404,9 @@ class DuplicityMethod(Backend):
         Include lines are paths relative to the source root, anchored to
         the resolved source path.  Returns ``(prefix_args, closing_args)``
         — the closing exclude goes after the translated exclusion args so
-        only listed paths remain.
+        only listed paths remain.  The restore-test marker is allowed
+        through ahead of the listed paths, since the closing exclude would
+        otherwise drop a marker sitting at the source root.
         """
         per_source = self.config.get("_source_includes", [])
         if index >= len(per_source):
@@ -417,10 +419,12 @@ class DuplicityMethod(Backend):
             lines.extend(read_filter_lines(Path(f)))
         if not lines or any(ln in (".", "/") for ln in lines):
             return [], []
+        name = str(self.config.get("_name", "unknown"))
+        marker = f"--include={source}/{marker_filename(name)}"
         prefix = [
             f"--include={source}/{ln.strip('/')}" for ln in lines if ln.strip("/")
         ]
-        return prefix, ["--exclude=**"]
+        return [marker, *prefix], ["--exclude=**"]
 
     def _exclude_args(self, source: Path, exclude_files: list[str]) -> list[str]:
         """Build duplicity include/exclude args from rsync-style exclusion files.
@@ -712,13 +716,16 @@ class DuplicityMethod(Backend):
             except ValueError as e:
                 return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": [str(e)]}
 
+        run_id = self.restore_test_run_id()
+        markers, _ = self.resolve_restore_markers(source_paths)
+
         # B2 credentials if targeting Backblaze
         b2_env, b2_errors = self._b2_env()
         if b2_errors:
             return {"files_copied": 0, "files_skipped": 0, "bytes_copied": 0, "errors": b2_errors}
 
         if not dry_run:
-            self._write_status("started")
+            self._write_status("started", run_id=run_id)
 
         # duplicity 3.x takes exactly one source per invocation, so run
         # once per source into its own archive subdirectory.  The loop
@@ -751,6 +758,10 @@ class DuplicityMethod(Backend):
 
                 # Per-source filter files: exclusion rules first (so they win),
                 # then include rules, then the closing --exclude=**.
+                if not dry_run:
+                    all_errors.extend(self.write_restore_markers(
+                        [m for m in markers if m["index"] == idx], run_id,
+                    ))
                 include_args, include_close = self._include_args(src, idx)
                 exclude_args = self._exclude_args(src, self._source_exclude_files(idx))
 
@@ -786,9 +797,12 @@ class DuplicityMethod(Backend):
             window.__exit__(None, None, None)
 
         if not dry_run:
+            record = self.restore_test_record(markers, run_id)
             if all_errors:
                 self._write_status(
                     "error",
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                     errors=all_errors,
@@ -796,6 +810,8 @@ class DuplicityMethod(Backend):
             else:
                 self._write_status(
                     "completed",
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                 )
@@ -829,9 +845,27 @@ class DuplicityMethod(Backend):
         if errors:
             return {"files_restored": 0, "bytes_restored": 0, "errors": errors}
 
-        # Restore always needs the passphrase
+        # Restore always needs the passphrase.  ``bu restore-test`` asks for
+        # the non-interactive resolution so an unattended run can never block
+        # on a prompt.
         try:
-            passphrase = self._resolve_passphrase()
+            if extra_args and extra_args.get("non_interactive"):
+                passphrase = self._non_interactive_passphrase()
+                if not passphrase:
+                    name = self.config.get("_name", "unknown")
+                    return {
+                        "files_restored": 0,
+                        "bytes_restored": 0,
+                        "errors": [
+                            (
+                                f"No passphrase available for {name!r}: set "
+                                "'passphrase_file' in the config or BU_PASSPHRASE "
+                                "in the environment."
+                            )
+                        ],
+                    }
+            else:
+                passphrase = self._resolve_passphrase()
         except ValueError as e:
             return {"files_restored": 0, "bytes_restored": 0, "errors": [str(e)]}
 
@@ -866,6 +900,7 @@ class DuplicityMethod(Backend):
             title=f"Restore output — {self.config.get('_name', '?')}",
         )
         window.__enter__()
+        quiet = bool(extra_args and extra_args.get("quiet"))
         try:
             for subdir in archives:
                 # A specific subpath restores into a subdirectory named
@@ -887,7 +922,10 @@ class DuplicityMethod(Backend):
                 args.append(str(dest_dir))
 
                 window.set_context(str(dest_dir))
-                result = self._run_duplicity(args, passphrase, window=window, extra_env=b2_env)
+                result = self._run_duplicity(
+                    args, passphrase, window=window, extra_env=b2_env,
+                    silence_stdout=quiet,
+                )
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
@@ -936,6 +974,7 @@ class DuplicityMethod(Backend):
             }
 
         result["exclude_files"] = list(self.config.get("_exclude_files", []))
+        result["restore_test_dirs"] = self.restore_test_dirs()
 
         # Source existence checks plus per-source filter files
         sources_status: list[dict[str, Any]] = []
@@ -1044,5 +1083,6 @@ class DuplicityMethod(Backend):
                 except (json.JSONDecodeError, OSError):
                     pass
 
+        result["notes"] = self.restore_test_notes()
         return result
 

@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from bu.backends.base import Backend, LiveWindow, run_streaming
-from bu.filters import build_include_rules, read_filter_lines, trailing_whitespace_warnings
+from bu.filters import (
+    build_include_rules,
+    marker_filename,
+    marker_include_rules,
+    read_filter_lines,
+    trailing_whitespace_warnings,
+)
 
 # ---------------------------------------------------------------------------
 # rsync binary resolution
@@ -144,7 +150,9 @@ class RsyncMethod(Backend):
 
     def preflight_notes(self) -> list[str]:
         """Warnings to show before a backup starts (filter-file footguns)."""
-        return trailing_whitespace_warnings(self._exclusion_files())
+        return super().preflight_notes() + trailing_whitespace_warnings(
+            self._exclusion_files()
+        )
 
     def _dest_dir(self) -> Path:
         """Return the destination directory (sources are mirrored directly into it)."""
@@ -309,8 +317,11 @@ class RsyncMethod(Backend):
 
         dest = self._dest_dir()
 
+        run_id = self.restore_test_run_id()
+        markers, _ = self.resolve_restore_markers(source_paths)
+
         if not dry_run:
-            self._write_status("started")
+            self._write_status("started", run_id=run_id)
 
         total_files = 0
         total_bytes = 0
@@ -328,6 +339,10 @@ class RsyncMethod(Backend):
             for idx, src_str in enumerate(source_paths):
                 src = Path(src_str).expanduser().resolve()
                 window.set_context(str(src))
+                if not dry_run:
+                    all_errors.extend(self.write_restore_markers(
+                        [m for m in markers if m["index"] == idx], run_id,
+                    ))
                 include_rules = self._source_include_rules(idx)
                 result = self._rsync_one(
                     src,
@@ -346,9 +361,12 @@ class RsyncMethod(Backend):
             window.__exit__(None, None, None)
 
         if not dry_run:
+            record = self.restore_test_record(markers, run_id)
             if all_errors:
                 self._write_status(
                     "error",
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                     errors=all_errors,
@@ -356,6 +374,8 @@ class RsyncMethod(Backend):
             else:
                 self._write_status(
                     "completed",
+                    run_id=run_id,
+                    restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                 )
@@ -414,6 +434,7 @@ class RsyncMethod(Backend):
                     "errors": [f"Backup path not found: {src}"]}
 
         # One live window for the restore run, with the target on the status line
+        quiet = bool(extra_args and extra_args.get("quiet"))
         window = LiveWindow(
             scroll_lines,
             title=f"Restore output — {self.config.get('_name', '?')}",
@@ -428,6 +449,7 @@ class RsyncMethod(Backend):
                 delete=False,
                 window=window,
                 exclude=self._status_path().name,
+                quiet=quiet,
             )
         finally:
             window.__exit__(None, None, None)
@@ -493,7 +515,12 @@ class RsyncMethod(Backend):
         return inc, self._source_exclude_filter_files(index)
 
     def _source_include_rules(self, index: int) -> list[str]:
-        """rsync include patterns for a source (empty when no include files)."""
+        """rsync include patterns for a source (empty when no include files).
+
+        The restore-test marker is allowed through ahead of the listed paths:
+        the closing ``--exclude=*`` would otherwise drop a marker sitting at
+        the source root, which is never in anybody's include file.
+        """
         per_source = self.config.get("_source_includes", [])
         if index >= len(per_source):
             return []
@@ -503,7 +530,11 @@ class RsyncMethod(Backend):
         lines: list[str] = []
         for f in files:
             lines.extend(read_filter_lines(Path(f)))
-        return build_include_rules(lines)
+        rules = build_include_rules(lines)
+        if not rules:
+            return []
+        name = str(self.config.get("_name", "unknown"))
+        return marker_include_rules(marker_filename(name)) + rules
 
     def _rsync_one(
         self,
@@ -518,6 +549,7 @@ class RsyncMethod(Backend):
         exclude_from: list[str] | None = None,
         link_dest: str | None = None,
         include_patterns: list[str] | None = None,
+        quiet: bool = False,
     ) -> dict[str, Any]:
         """Run rsync for a single source directory → dest subdir.
 
@@ -532,6 +564,8 @@ class RsyncMethod(Backend):
         are runtime objects, and SMB/NFS cannot store Unix sockets).
         Output streams live (``-v`` file listing; ``--progress`` bars when
         stdout is a TTY), confined to a window when ``scroll_lines`` > 0.
+        ``quiet`` captures both streams without writing them anywhere, which
+        is what ``bu restore-test`` wants.
         Returns ``{files, bytes, errors, stdout, stderr}``.
         """
         # Ensure dest parent exists (rsync can create the leaf)
@@ -564,7 +598,10 @@ class RsyncMethod(Backend):
         cmd.append(str(dest))
 
         try:
-            proc = run_streaming(cmd, scroll_lines=scroll_lines, window=window, title=title)
+            proc = run_streaming(
+                cmd, scroll_lines=scroll_lines, window=window, title=title,
+                silence_stdout=quiet, silence_stderr=quiet,
+            )
         except FileNotFoundError:
             return {"files": 0, "bytes": 0, "errors": ["rsync binary not found. Is it installed?"],
                     "stdout": "", "stderr": ""}
@@ -627,6 +664,7 @@ class RsyncMethod(Backend):
             "dest_path": str(dest_dir),
             "dest_exists": dest_dir.is_dir(),
             "exclude_files": list(self.config.get("_exclude_files", [])),
+            "restore_test_dirs": self.restore_test_dirs(),
         }
 
         # Check existence of each source path plus its filter files
@@ -654,7 +692,7 @@ class RsyncMethod(Backend):
         else:
             result["last_backup"] = None
 
-        result["notes"] = self._rsync_notes()
+        result["notes"] = self._rsync_notes() + self.restore_test_notes()
         return result
 
     # --- helpers (only _parse_rsync_stat retained for backup) ---

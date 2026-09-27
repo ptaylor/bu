@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Self
+
+from bu.filters import last_entry, marker_filename, restore_test_warnings
 
 try:  # POSIX only — bu targets macOS and Linux
     import resource as _resource
@@ -246,6 +252,41 @@ class LiveWindow:
 MIN_OPEN_FILE_LIMIT = 1024
 
 
+def on_disk_name(parent: Path, name: str) -> str:
+    """Return ``name`` as spelled inside ``parent``, or ``name`` when unknown."""
+    try:
+        for entry in os.scandir(parent):
+            if entry.name.lower() == name.lower():
+                return entry.name
+    except OSError:
+        pass
+    return name
+
+
+def on_disk_path(path: Path) -> Path:
+    """Return ``path`` with every existing component spelled as it is on disk.
+
+    macOS volumes are case-insensitive but case-*preserving*, so a configured
+    ``.../Dropbox/backups`` can name a directory that is actually called
+    ``Backups`` — and ``Path.resolve()`` never corrects the spelling.  The
+    backup copies the on-disk name, so recording the configured spelling would
+    build a path that does not exist whenever the destination is a
+    case-sensitive volume (APFS can be, and often is on external disks).
+    Components that do not exist keep the given spelling: bu creates them.
+    Symlinks are resolved first, so the result stays comparable with the
+    resolved source paths (``/tmp`` and ``/private/tmp`` are the same place).
+    """
+    expanded = path.expanduser().resolve()
+    current = Path(expanded.anchor)
+    for part in expanded.relative_to(expanded.anchor).parts:
+        candidate = current / part
+        if candidate.exists():
+            current = current / on_disk_name(current, part)
+        else:
+            current = candidate
+    return current
+
+
 def ensure_open_file_limit(minimum: int = MIN_OPEN_FILE_LIMIT) -> bool:
     """Raise the soft ``RLIMIT_NOFILE`` to at least ``minimum`` (best effort).
 
@@ -450,11 +491,297 @@ class Backend(ABC):
     def preflight_notes(self) -> list[str]:
         """Advisory warnings to show before a backup starts.
 
-        Defaults to none; backends override this for configuration
-        footguns that don't block the run (e.g. exclusion patterns that
-        rsync would silently ignore).
+        Defaults to the restore-test configuration checks.  Backends override
+        this for configuration footguns that don't block the run (e.g.
+        exclusion patterns that rsync would silently ignore) and must chain to
+        ``super()`` so these survive.
         """
-        return []
+        return self.restore_test_notes()
+
+    # ------------------------------------------------------------------
+    # restore-test markers (bu restore-test)
+    # ------------------------------------------------------------------
+
+    def restore_test_dirs(self) -> list[str]:
+        """Configured restore-test directories (absolute paths), if any."""
+        return [str(p) for p in self.config.get("_restore_test_dirs", [])]
+
+    def _source_subdirs(self, source_paths: list[str]) -> dict[int, str]:
+        """Map source index -> the subdirectory the backup uses for it.
+
+        Applies the same basename dedup (``_2``, ``_3``) the backends apply, so
+        a marker's path inside the backup always names the right archive or
+        snapshot subdirectory.
+        """
+        used: set[str] = set()
+        subdirs: dict[int, str] = {}
+        for idx, sp in enumerate(source_paths):
+            base = Path(sp).expanduser().name or f"src{idx}"
+            candidate = base
+            n = 2
+            while candidate in used:
+                candidate = f"{base}_{n}"
+                n += 1
+            used.add(candidate)
+            subdirs[idx] = candidate
+        return subdirs
+
+    def resolve_restore_markers(
+        self, source_paths: list[str],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Map each restore-test directory to the source tree that owns it.
+
+        Returns ``(markers, warnings)``.  A directory outside every source tree
+        becomes a warning and is skipped — never an error, so a stale entry
+        cannot stop a backup.  Where sources are nested (Dropbox lives inside
+        ``$HOME``) the longest matching source path wins, so the marker is
+        verified against the archive that actually receives it.
+        """
+        name = str(self.config.get("_name", "unknown"))
+        marker_file = marker_filename(name)
+        sources = [
+            (idx, Path(sp).expanduser().resolve())
+            for idx, sp in enumerate(source_paths)
+        ]
+        # Containment is decided on the directories' real on-disk names, which
+        # is also what the backup records (see on_disk_path).
+        canonical = [(idx, on_disk_path(src)) for idx, src in sources]
+        subdirs = self._source_subdirs(source_paths)
+
+        markers: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for raw in self.restore_test_dirs():
+            display = Path(raw).expanduser()
+            real = on_disk_path(display)
+            owner: tuple[int, Path] | None = None
+            for idx, src in canonical:
+                if real != src and src not in real.parents:
+                    continue
+                if owner is None or len(str(src)) > len(str(owner[1])):
+                    owner = (idx, src)
+            if owner is None:
+                warnings.append(
+                    f"restore-test directory {display} is not inside any source path "
+                    f"of {name!r} — it will be skipped"
+                )
+                continue
+            idx, src = owner
+            rel = real.relative_to(src)
+            markers.append({
+                "dir": str(real),
+                "path": str(real / marker_file),
+                "source": str(src),
+                "index": idx,
+                "source_subdir": subdirs[idx],
+                "rel_dir": "" if rel == Path(".") else rel.as_posix(),
+                "marker_file": marker_file,
+            })
+        return markers, warnings
+
+    def _restore_test_exclude_files(self, index: int) -> list[str]:
+        """Own + destination-level exclusion files for a source (may not exist)."""
+        per_source = self.config.get("_source_excludes", [])
+        own = per_source[index] if index < len(per_source) and per_source[index] else []
+        ordered: list[str] = []
+        for path in [*own, *self.config.get("_exclude_files", [])]:
+            if isinstance(path, str) and path not in ordered:
+                ordered.append(path)
+        return ordered
+
+    def restore_test_notes(self) -> list[str]:
+        """Warnings about the restore-test configuration (never blocking)."""
+        markers, warnings = self.resolve_restore_markers(
+            self.config.get("_source_paths", []),
+        )
+        for marker in markers:
+            idx = marker["index"]
+            includes = self.config.get("_source_includes", [])
+            own_includes = includes[idx] if idx < len(includes) else []
+            warnings.extend(restore_test_warnings(
+                marker_file=marker["marker_file"],
+                rel_dir=marker["rel_dir"],
+                include_files=[str(p) for p in own_includes or []],
+                exclude_files=self._restore_test_exclude_files(idx),
+            ))
+        return warnings
+
+    def restore_test_run_id(self) -> str:
+        """Value identifying this run, appended to every marker file.
+
+        The snapshot backend overrides this with the snapshot directory name,
+        so a marker inside a snapshot always names that snapshot.
+        """
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def write_restore_markers(
+        self, markers: list[dict[str, Any]], value: str,
+    ) -> list[str]:
+        """Create each marker directory and append ``value`` to its marker file.
+
+        The append is skipped when the last line is already ``value``, so a
+        resumed run (``bu backup-restart`` reuses the snapshot timestamp) or a
+        directory claimed by two nested sources never duplicates an entry.
+        Returns error strings; a failed marker is reported but not fatal.
+        """
+        errors: list[str] = []
+        for marker in markers:
+            path = Path(marker["path"])
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_file() and last_entry(path.read_text(errors="replace")) == value:
+                    continue
+                with open(path, "a") as fh:
+                    fh.write(value + "\n")
+            except OSError as e:
+                errors.append(
+                    f"Cannot write restore-test marker {path}: {e.strerror or e}"
+                )
+        return errors
+
+    def restore_test_record(
+        self, markers: list[dict[str, Any]], run_id: str,
+    ) -> list[dict[str, Any]]:
+        """Compact marker records for the status file (what to verify later)."""
+        return [
+            {
+                "dir": m["dir"],
+                "source": m["source"],
+                "source_subdir": m["source_subdir"],
+                "rel_dir": m["rel_dir"],
+                "marker_file": m["marker_file"],
+                "run_id": run_id,
+            }
+            for m in markers
+        ]
+
+    def read_status(self) -> dict[str, Any]:
+        """Return the parsed status file, or ``{}`` when missing/unreadable."""
+        path = self._status_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _restore_test_backup_path(
+        self, entry: dict[str, Any], status: dict[str, Any],
+    ) -> str:
+        """Path of a marker inside the backup, as ``bu restore`` expects it."""
+        parts = [
+            entry.get("source_subdir") or "",
+            str(entry.get("rel_dir") or ""),
+            entry.get("marker_file") or "",
+        ]
+        return "/".join(p for p in parts if p)
+
+    def restore_test(self, *, scroll_lines: int = 0) -> dict[str, Any]:
+        """Restore every marker file and check its newest entry.
+
+        Reads the marker list and run id the last backup recorded, restores
+        each marker into a private temporary directory, and passes when the
+        file arrives and its newest entry is that run id.  The temporary
+        directory is always removed — the findings come back in ``results``
+        instead.  Destinations that need a passphrase resolve it without
+        prompting, so this is safe to run unattended.
+        """
+        name = str(self.config.get("_name", "unknown"))
+        status = self.read_status()
+        entries = status.get("restore_test") or []
+        expected = str(status.get("run_id") or "")
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "checked": 0,
+            "passed": 0,
+            "failed": 0,
+            "expected": expected,
+            "results": [],
+            "errors": [],
+        }
+        if not self.restore_test_dirs():
+            result["errors"] = ["No restore-test directories configured."]
+            return result
+        if not entries:
+            result["ok"] = False
+            result["errors"] = [
+                (
+                    f"Last backup of {name!r} recorded no restore-test markers — "
+                    f"run 'bu backup {name}' first."
+                )
+            ]
+            return result
+        if not expected:
+            result["ok"] = False
+            result["errors"] = [
+                (
+                    f"Last backup of {name!r} recorded no run id — "
+                    f"re-run 'bu backup {name}'."
+                )
+            ]
+            return result
+
+        scratch = Path(tempfile.mkdtemp(prefix=f"bu-restore-test-{name}-"))
+        try:
+            for position, entry in enumerate(entries):
+                outcome = self._verify_restore_test_entry(
+                    entry, expected, status, scratch, position,
+                )
+                result["results"].append(outcome)
+                if not outcome["ok"]:
+                    result["errors"].append(f"{outcome['path']}: {outcome['error']}")
+            result["checked"] = len(result["results"])
+            result["passed"] = sum(1 for r in result["results"] if r["ok"])
+            result["failed"] = result["checked"] - result["passed"]
+            result["ok"] = result["failed"] == 0
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return result
+
+    def _verify_restore_test_entry(
+        self,
+        entry: dict[str, Any],
+        expected: str,
+        status: dict[str, Any],
+        scratch: Path,
+        position: int,
+    ) -> dict[str, Any]:
+        """Restore one marker into ``scratch`` and compare its newest entry."""
+        backup_path = self._restore_test_backup_path(entry, status)
+        marker_file = str(entry.get("marker_file", ""))
+        outcome: dict[str, Any] = {
+            "dir": entry.get("dir", "?"),
+            "path": str(Path(str(entry.get("dir", ""))).expanduser() / marker_file),
+            "backup_path": backup_path,
+            "expected": expected,
+            "actual": None,
+            "ok": False,
+            "error": None,
+        }
+        restore_dir = scratch / str(position)
+        restore_dir.mkdir(parents=True, exist_ok=True)
+        restored = self.restore(
+            str(restore_dir),
+            backup_path,
+            extra_args={"non_interactive": True, "quiet": True},
+        )
+        if restore_errors := restored.get("errors"):
+            outcome["error"] = "; ".join(str(e) for e in restore_errors)
+            return outcome
+        target = restore_dir / Path(backup_path).name
+        if not target.is_file():
+            outcome["error"] = f"marker file was not restored (expected {target})"
+            return outcome
+        actual = last_entry(target.read_text(errors="replace"))
+        outcome["actual"] = actual
+        if actual == expected:
+            outcome["ok"] = True
+        else:
+            outcome["error"] = (
+                f"last entry {actual or '(empty)'} does not match the run id {expected}"
+            )
+        return outcome
 
     def list_files(
         self,

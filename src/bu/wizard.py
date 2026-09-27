@@ -515,6 +515,12 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
     else:
         print(_paint("dim", f"  Using {include_file.name} (already exists)"))
 
+    if sources:
+        _note(
+            "restore_test_dirs will list each source root, so 'bu restore-test' "
+            "can prove the backup is readable"
+        )
+
     # ------------------------------------------------------------------
     # 10. Assemble and write the config
     # ------------------------------------------------------------------
@@ -537,6 +543,16 @@ def run_create_wizard(config_dir: Path | None = None, name: str | None = None) -
             "# Per-source include list (created empty — add paths relative to the source):"
         )
         lines.append(example)
+        # One marker directory per source root: bu writes a marker file into
+        # each before every backup, and 'bu restore-test' restores it from the
+        # destination to prove the backup is readable.
+        lines.append(
+            "# Restore-test markers — 'bu restore-test' restores the marker file bu"
+        )
+        lines.append(
+            "# writes here before each backup, proving the backup is readable:"
+        )
+        lines.append(f"restore_test_dirs = {_toml_str_list(sources)}")
     lines.append(f"destination = {_toml_str(dest)}")
     for key, value in extra.items():
         lines.append(f"{key} = {_toml_value(value)}")
