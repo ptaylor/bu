@@ -183,6 +183,15 @@ bu ACTION NAME [ARGS...]
 - Status file: `<destination>/bu-<NAME>-status.txt` (JSON content), written at
   backup start/end (`started`/`completed`/`error`). Dry-runs write nothing.
   The status file is NOT synced back on restore.
+- **Exit code 24 (`RERR_VANISHED`) is a warning, not a failure.**  A file that
+  vanished between the scan and the transfer is absent from the new snapshot and
+  still present in the previous one, so `_rsync_one` returns it in `warnings`
+  (not `errors`); the backends record it in the status file's `warnings` and in
+  the run `notes`, and `bu status` prints a `Warnings` block.  Every other
+  non-zero code stays fatal, and `list_files` tolerates 24 as well.
+- `--stats` runs with `-h`, so sizes carry a unit suffix and are parsed with
+  `parse_rsync_size`: reading only the leading digits reported a 255 GB source
+  as 255 bytes (that is where `bytes_copied` numbers like `1086` came from).
 - rsync reads exclusion files itself and keeps trailing whitespace as part
   of the pattern, so `Pictures/Takeout ` (stray space) silently never
   matches. `bu backup` prints such lines as warnings before the run starts

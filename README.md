@@ -305,6 +305,14 @@ Per-destination runtime files are stored under `~/.local/state/bu/`:
 > automatically). You can also force a specific binary with the
 > `BU_RSYNC` environment variable.
 
+> When a file disappears between rsync's scan and the transfer — a cloud
+> client rewriting it, or you renaming or moving something mid-run — rsync
+> reports `some files vanished before they could be transferred` (exit code
+> 24). bu treats that as a **warning**, not a failure: the file is simply
+> absent from the new snapshot, and the previous snapshot still holds it.
+> `bu backup` prints the warning, `bu status` lists it under `Warnings`, and
+> the run still completes. Every other non-zero code remains fatal.
+
 > **About `._*` files on SMB/NAS destinations:** when macOS writes any
 > file or folder to an SMB share that doesn't store extended attributes
 > natively (like the WD MyBookLive), it creates a hidden `._name`
