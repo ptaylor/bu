@@ -47,6 +47,36 @@ _RSYNC_CANDIDATES: tuple[str, ...] = (
 )
 
 
+# rsync exit code for "some files vanished before they could be transferred":
+# they disappeared between the file-list scan and the transfer, so the source no
+# longer has them.  Not fatal (see ``_rsync_one``).
+RERR_VANISHED = 24
+
+# ``--stats`` runs with ``-h``, so sizes carry a 1024-based unit suffix.
+_SIZE_UNITS: dict[str, int] = {
+    "": 1,
+    "K": 1024,
+    "M": 1024 ** 2,
+    "G": 1024 ** 3,
+    "T": 1024 ** 4,
+    "P": 1024 ** 5,
+}
+
+
+def parse_rsync_size(text: str) -> int:
+    """Parse an rsync human-readable size (``255.81G``, ``2.17K``) into bytes.
+
+    Reading only the leading digits turns a 255 GB source into 255 "bytes" —
+    which is what ``bu status`` used to report for a `--stats` line like
+    ``total size is 255.81G``.
+    """
+    match = re.match(r"\s*([\d,]+(?:\.\d+)?)\s*([KMGTP]?)B?\s*$", text, re.IGNORECASE)
+    if not match:
+        return 0
+    number = float(match.group(1).replace(",", ""))
+    return int(number * _SIZE_UNITS[match.group(2).upper()])
+
+
 def _is_openrsync(binary: str) -> bool:
     """True if ``binary`` is Apple's openrsync (or any pre-3.0 rsync)."""
     try:
@@ -262,7 +292,10 @@ class RsyncMethod(Backend):
             # rsync walks the tree quickly, so its (much smaller) output is
             # captured and replayed; stderr stays separate for errors.
             result = run_streaming(cmd, silence_stdout=True, silence_stderr=True)
-            if result.returncode != 0:
+            # Exit 24 means some paths vanished while the tree was being
+            # scanned; the listing of everything else is still usable, so only
+            # the other codes are fatal.
+            if result.returncode not in (0, RERR_VANISHED):
                 detail = result.stderr.strip() or f"rsync exited {result.returncode}"
                 entry["errors"].append(detail)
                 errors.append(f"{src}: {detail}")
@@ -326,6 +359,7 @@ class RsyncMethod(Backend):
         total_files = 0
         total_bytes = 0
         all_errors: list[str] = []
+        all_warnings: list[str] = []
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
@@ -355,6 +389,7 @@ class RsyncMethod(Backend):
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
+                all_warnings.extend(result.get("warnings", []))
                 all_stdout.append(result.get("stdout", ""))
                 all_stderr.append(result.get("stderr", ""))
         finally:
@@ -370,6 +405,7 @@ class RsyncMethod(Backend):
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                     errors=all_errors,
+                    warnings=all_warnings,
                 )
             else:
                 self._write_status(
@@ -378,6 +414,7 @@ class RsyncMethod(Backend):
                     restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
+                    warnings=all_warnings,
                 )
 
         return {
@@ -388,7 +425,7 @@ class RsyncMethod(Backend):
             "stdout": "\n".join(all_stdout).strip(),
             "stderr": "\n".join(all_stderr).strip(),
             "rsync_version": self._rsync_version(),
-            "notes": self._rsync_notes(),
+            "notes": [*self._rsync_notes(), *all_warnings],
         }
 
     # ------------------------------------------------------------------
@@ -460,6 +497,7 @@ class RsyncMethod(Backend):
             "errors": result["errors"],
             "stdout": result.get("stdout", ""),
             "stderr": result.get("stderr", ""),
+            "notes": result.get("warnings", []),
             "rsync_version": self._rsync_version(),
         }
 
@@ -607,18 +645,27 @@ class RsyncMethod(Backend):
                     "stdout": "", "stderr": ""}
 
         errors: list[str] = []
+        warnings: list[str] = []
         if proc.returncode != 0:
-            # rsync exit codes: 0=success, >0=partial or error
+            # rsync exit codes: 0=success, 24=some files vanished between the
+            # scan and the transfer, anything else=partial transfer or error.
+            # A vanished file is simply gone from the source, so the new
+            # snapshot omits it and the previous snapshot still holds it —
+            # failing the whole run over that would be heavy-handed, and cloud
+            # clients churn files often enough for it to happen regularly.
             stderr = proc.stderr.strip()
             if stderr:
-                errors.append(stderr)
-                if "mkstempsock" in stderr:
-                    errors.append(
-                        "openrsync failed to copy a socket file (SMB/NFS "
-                        "cannot store Unix sockets). bu passes --no-specials "
-                        "to skip them — install a full rsync ('brew install "
-                        "rsync') if this persists."
-                    )
+                if proc.returncode == RERR_VANISHED:
+                    warnings.append(stderr)
+                else:
+                    errors.append(stderr)
+                    if "mkstempsock" in stderr:
+                        errors.append(
+                            "openrsync failed to copy a socket file (SMB/NFS "
+                            "cannot store Unix sockets). bu passes --no-specials "
+                            "to skip them — install a full rsync ('brew install "
+                            "rsync') if this persists."
+                        )
 
         # Parse --stats summary for file count and byte total
         files_str = self._parse_rsync_stat(proc.stdout, r"Number of (?:regular )?files(?: transferred)?:\s+([\d,]+)")
@@ -627,15 +674,12 @@ class RsyncMethod(Backend):
         except ValueError:
             files = 0
 
-        # "total size is N" line gives bytes as a plain integer
-        size_str = self._parse_rsync_stat(proc.stdout, r"total size is ([\d,]+)")
-        try:
-            bytes_transferred = int(size_str) if size_str else 0
-        except ValueError:
-            bytes_transferred = 0
+        # "total size is N" — human-readable because --stats is run with -h.
+        size_str = self._parse_rsync_stat(proc.stdout, r"total size is ([\d.,]+[KMGTP]?)")
+        bytes_transferred = parse_rsync_size(size_str) if size_str else 0
 
         return {"files": files, "bytes": bytes_transferred, "errors": errors,
-                "stdout": proc.stdout, "stderr": proc.stderr}
+                "warnings": warnings, "stdout": proc.stdout, "stderr": proc.stderr}
 
     @staticmethod
     def _parse_rsync_stat(output: str, pattern: str) -> str:

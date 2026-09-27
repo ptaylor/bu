@@ -257,6 +257,7 @@ class SnapshotMethod(RsyncMethod):
         total_files = 0
         total_bytes = 0
         all_errors: list[str] = []
+        all_warnings: list[str] = []
         all_stdout: list[str] = []
         all_stderr: list[str] = []
 
@@ -305,6 +306,7 @@ class SnapshotMethod(RsyncMethod):
                 total_files += result["files"]
                 total_bytes += result["bytes"]
                 all_errors.extend(result["errors"])
+                all_warnings.extend(result.get("warnings", []))
                 all_stdout.append(result.get("stdout", ""))
                 all_stderr.append(result.get("stderr", ""))
         finally:
@@ -321,6 +323,7 @@ class SnapshotMethod(RsyncMethod):
                     files_copied=total_files,
                     bytes_copied=total_bytes,
                     errors=all_errors,
+                    warnings=all_warnings,
                 )
             else:
                 self._write_status(
@@ -330,6 +333,7 @@ class SnapshotMethod(RsyncMethod):
                     restore_test=record,
                     files_copied=total_files,
                     bytes_copied=total_bytes,
+                    warnings=all_warnings,
                 )
 
         return {
@@ -341,7 +345,7 @@ class SnapshotMethod(RsyncMethod):
             "stderr": "\n".join(all_stderr).strip(),
             "snapshot": ts,
             "rsync_version": self._rsync_version(),
-            "notes": self._rsync_notes(),
+            "notes": [*self._rsync_notes(), *all_warnings],
         }
 
     # ------------------------------------------------------------------
@@ -440,6 +444,7 @@ class SnapshotMethod(RsyncMethod):
             "errors": result["errors"],
             "stdout": result.get("stdout", ""),
             "stderr": result.get("stderr", ""),
+            "notes": result.get("warnings", []),
             "snapshot": snap.name,
             "rsync_version": self._rsync_version(),
         }

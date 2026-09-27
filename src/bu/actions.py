@@ -1090,7 +1090,9 @@ def format_result(result: dict[str, Any], json_output: bool = False) -> str:
                 lines.append(f"  - {err}")
         elif key == "notes" and isinstance(value, list) and value:
             for note in value:
-                lines.append(f"  ℹ {note}")
+                parts = str(note).splitlines() or [""]
+                lines.append(f"  ℹ {parts[0]}")
+                lines.extend(f"    {extra}" for extra in parts[1:])
         elif key == "files" and isinstance(value, list):
             lines.append(f"{key}: {len(value)} file(s)")
         elif isinstance(value, list):
@@ -1240,6 +1242,13 @@ def format_status(result: dict[str, Any], json_output: bool = False) -> str:
             lines.append(f"  Errors      : {len(errors)}")
             for err in errors:
                 lines.append(f"    - {err}")
+        warnings = last.get("warnings", [])
+        if warnings:
+            lines.append(f"  Warnings    : {len(warnings)}")
+            for warn in warnings:
+                parts = str(warn).splitlines() or [""]
+                lines.append(f"    - {parts[0]}")
+                lines.extend(f"      {extra}" for extra in parts[1:])
     elif result.get("status_file_error"):
         lines.append(f"  Status file : corrupt ({result['status_file_error']})")
 
