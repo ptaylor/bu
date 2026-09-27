@@ -13,7 +13,7 @@ snapshots, or encrypted incremental duplicity archives (local disk or Backblaze 
 bu ACTION [ARGS...]
 ```
 
-- **`ACTION`** — one of: `backup`, `restore`, `status`, `list`, `config`, `history`, `log`, `encrypt`, `create`, `help`
+- **`ACTION`** — one of: `backup`, `backup-restart`, `backup-remove`, `backup-dry-run`, `restore`, `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`, `create`, `help`
 - **`NAME`** — a named destination defined in the configuration
 
 Commands take positional arguments only — no flags to remember. Use `bu help`
@@ -26,6 +26,7 @@ Commands take positional arguments only — no flags to remember. Use `bu help`
 | `bu backup NAME` | Back up source directories to the destination (rsync, snapshot, or duplicity). Refuses to run while the previous run is not `completed` |
 | `bu backup-restart NAME` | Reset a failed/ongoing backup's status and start again; refuses when the last run completed (snapshot resumes the same timestamped directory) |
 | `bu backup-remove NAME` | Remove an incomplete snapshot directory (snapshot only; refuses when the last run completed; asks for confirmation) |
+| `bu backup-dry-run NAME` | List the files the next backup would consider, writing nothing. Paths stream to stdout as they are found; the filters in effect and the totals go to stderr |
 | `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes; refuses while the last backup is not `completed`) |
 | `bu status NAME` | Show config, destination state, and last backup details |
 | `bu list` | List all configured destinations |
@@ -126,8 +127,12 @@ Files can be skipped during backup with exclusion files. Without an
 - `~/.config/bu/exclude.txt` — global exclusions for every destination
 - `~/.config/bu/exclude-NAME.txt` — exclusions for the `NAME` destination
 
-Setting `exclude_files` replaces the defaults with your own list. The same
-file format works for rsync and duplicity:
+Setting `exclude_files` replaces the defaults with your own list. A source's
+own `exclude` files (see [Include lists](#include-lists-optional)) are **added**
+to these defaults rather than replacing them, so the global exclusions really
+do apply to every source.
+
+One pattern per line — the same format works for rsync and duplicity:
 
 ```
 # comments and blank lines are ignored
@@ -174,8 +179,9 @@ source_paths = [
 - `include` — file listing paths relative to that source (one per line;
   `#` comments and blank lines ignored). Only the listed paths are backed
   up; a line of `.` backs up the whole source. A single file or a list.
-- `exclude` — rsync-style exclusion file for that source. When omitted, the
-  destination-level `exclude_files` defaults apply.
+- `exclude` — rsync-style exclusion file for that source. These are added to
+the destination-level `exclude_files` rather than replacing them, and are
+consulted first — so a `+ ` exception here can override a broad default.
 - Per source, the filter order is: exclusion rules, then the includes, then
   everything else is skipped — so exclusions win over includes. Removing a
   line stops updating that path but never deletes the copy already in the
@@ -217,6 +223,26 @@ Per-destination runtime files are stored under `~/.local/state/bu/`:
   destinations
 - `duplicity` (3.x) and `gpg` — for `method = "duplicity"` destinations
   (local disk or Backblaze B2)
+
+> duplicity refuses to run when the process may open fewer than 1024 files,
+> and macOS gives Finder/launchd/cron processes only 256. bu raises the limit
+> for itself and every tool it runs, so `bu backup`/`bu restore` work from any
+> launch context.
+
+> **macOS: run bu from a process with Full Disk Access.** Several common
+> sources are protected by TCC — `~/Pictures/Photos Library.photoslibrary`,
+> `~/Library/Mail`, `~/Library/Safari`, and the Dropbox folder under
+> `~/Library/CloudStorage/`. Without Full Disk Access (System Settings →
+> Privacy & Security → Full Disk Access) rsync fails with
+> `Operation not permitted` and the run ends in `error`. Google Drive stays
+> readable without it, so one blocked source is easy to miss — check for
+> `Operation not permitted` in `bu log NAME`.
+>
+> A blocked source never costs you data you already have: rsync reports
+> `IO error encountered -- skipping file deletion`, so the files already in
+> the snapshot are left alone. The run still exits non-zero and is marked
+> `error` (`bu backup-restart` to retry); the affected subtree is simply
+> missing from that snapshot.
 
 > macOS ships Apple's openrsync as `/usr/bin/rsync`, which cannot copy
 > Unix socket files (e.g. `~/.gnupg/S.gpg-agent*`) to SMB/NFS shares —
@@ -260,6 +286,9 @@ pip install -e ".[dev]"
 ```bash
 # Create a new destination config
 bu create photos
+
+# Preview the files the next backup would consider (nothing is written)
+bu backup-dry-run photos > /tmp/photos-files.txt
 
 # Run a backup
 bu backup photos

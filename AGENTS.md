@@ -11,9 +11,9 @@ or Backblaze B2).
 bu ACTION NAME [ARGS...]
 ```
 
-- `ACTION` is one of: `backup`, `backup-restart`, `backup-remove`, `restore`,
-  `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`,
-  `create`, `help`.
+- `ACTION` is one of: `backup`, `backup-restart`, `backup-remove`,
+  `backup-dry-run`, `restore`, `status`, `list`, `config`, `delete`,
+  `history`, `log`, `encrypt`, `create`, `help`.
 - `NAME` is a named destination that exists as a `.toml` config file
   (except `list`, `encrypt`, `create`, and bare `config`, which take no
   name).
@@ -38,6 +38,22 @@ bu ACTION NAME [ARGS...]
   is not `completed`.  `bu status` prints the remediation hints.
 - `bu delete NAME` removes ONLY the config file (always prompts for
   confirmation). It must always warn that backup contents are not deleted.
+- `bu backup-dry-run NAME` lists the paths the next backup would consider and
+  writes nothing — no status file, history entry or log — so it also runs
+  while a backup is in progress or failed.  Paths stream to stdout as they are
+  found (pipeable); the filter files in effect, per-source progress
+  (`on_source`) and the totals go to stderr.  rsync/snapshot drive rsync's dry
+  run into a non-existent placeholder target (nothing to compare against ->
+  every selected path is listed, not just changes); duplicity has no listing
+  mode, so it runs `backup --dry-run --verbosity=9` against a scratch
+  `file://` target plus `--archive-dir` and filters the `Selecting <path>`
+  lines as they stream — the log is hundreds of megabytes for a big source, so
+  `run_filtered` never buffers it, and the real archive is never contacted
+  (`Backend.list_files`).  Failed runs surface duplicity's own diagnostic line
+  (`_looks_like_error`), not its housekeeping.  Every source is scanned
+  independently and a failure is attached to that source's own entry: one
+  unreadable source must never report the sources after it as `0 path(s)`
+  (it used to, which made a real backup look pointless).
 
 ### Destination names
 
@@ -79,8 +95,9 @@ bu ACTION NAME [ARGS...]
   `{ path = "/src", include = ["inc.txt"], exclude = ["exc.txt"] }`.
   `include` lists paths relative to that source (only listed paths are
   backed up, `.` = whole source); `exclude` is an rsync-style exclusion file
-  for that source (falls back to the destination-level exclude files when
-  omitted).  `DestinationConfig` parses them; backends receive
+  for that source, **additive** with the destination-level exclude files (its
+  own files are consulted first, then the defaults; `exclude = []` adds
+  nothing).  `DestinationConfig` parses them; backends receive
   `_source_includes` and `_source_excludes` lists aligned with
   `_source_paths`.  `src/bu/filters.py` has `read_filter_lines` and
   `build_include_rules` (parent-chain `+` rules for rsync).
@@ -190,6 +207,12 @@ bu ACTION NAME [ARGS...]
   result errors, and raw log).  `bu status` also captures collection-status
   stdout silently (`silence_stdout=True` in `run_streaming`): the raw report
   lands in `last_backup.output`, not on the terminal.
+- `ensure_open_file_limit()` in `base.py` raises the soft `RLIMIT_NOFILE` to
+  1024 on every `run_streaming` call, so the tool and its children inherit it.
+  duplicity 3.x calls `log.FatalError` for full/inc/restore runs below that,
+  and macOS gives Finder/launchd/cron processes 256 — without this, a restore
+  aborts before touching the network with "Max open files of 256 is too low".
+  It only ever raises (never lowers) the soft limit and ignores failure.
 
 ## Runtime state
 
@@ -232,3 +255,13 @@ bu ACTION NAME [ARGS...]
 - Lint with ruff (line-length 100).
 - Keep sample templates, wizard output, and README in sync when changing config
   keys, layout, or command behavior.
+- **Agent terminals have no Full Disk Access**: this shell is a child of VS
+  Code's `Code Helper`, so `~/Library/{Mail,Safari}`,
+  `~/Pictures/Photos Library.photoslibrary` and
+  `~/Library/CloudStorage/Dropbox` all answer `Operation not permitted`
+  (Google Drive under `CloudStorage/` is readable).  Don't read that as a real
+  backup failure — a genuine snapshot run has 0 occurrences of it in
+  `~/.local/state/bu/logs/<name>.log`.  Ask the user to run the backup from
+  their own terminal.  A blocked source ends the run in `error`, but rsync
+  skips deletions after an I/O error, so it never removes data already in the
+  snapshot.
