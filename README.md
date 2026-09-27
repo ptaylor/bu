@@ -13,7 +13,7 @@ snapshots, or encrypted incremental duplicity archives (local disk or Backblaze 
 bu ACTION [ARGS...]
 ```
 
-- **`ACTION`** — one of: `backup`, `backup-restart`, `backup-remove`, `backup-dry-run`, `restore`, `restore-test`, `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`, `create`, `help`
+- **`ACTION`** — one of: `backup`, `backup-restart`, `backup-remove`, `backup-dry-run`, `restore`, `restore-test`, `prune`, `status`, `list`, `config`, `delete`, `history`, `log`, `encrypt`, `create`, `help`
 - **`NAME`** — a named destination defined in the configuration
 
 Commands take positional arguments only — no flags to remember. Use `bu help`
@@ -29,6 +29,7 @@ Commands take positional arguments only — no flags to remember. Use `bu help`
 | `bu backup-dry-run NAME` | List the files the next backup would consider, writing nothing. Paths stream to stdout as they are found; the filters in effect and the totals go to stderr |
 | `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes; refuses while the last backup is not `completed`) |
 | `bu restore-test NAME` | Restore the last backup's marker files into a temporary directory and verify them — proves the backup is readable. Read-only; refuses while the last backup is not `completed` |
+| `bu prune NAME` | List the snapshots a retention policy would remove (snapshot only). **Lists only — deletes nothing** |
 | `bu status NAME` | Show config, destination state, and last backup details |
 | `bu list` | List all configured destinations |
 | `bu config [NAME]` | Edit (or create) a destination config in `$EDITOR` |
@@ -239,6 +240,49 @@ are modified. Nothing is checked when no `restore_test_dirs` are configured.
 > uploaded like any other file and appears on your other devices. It is a few
 > dozen bytes plus one line per backup.
 
+### Pruning snapshots
+
+`bu prune NAME` works out which timestamped snapshots a retention policy would
+remove. It applies to **snapshot** destinations only — other methods say so and
+exit — and in this version it **lists the plan and deletes nothing**:
+
+```
+Policy
+  all snapshots from today
+  one per day for the last 7 days
+  one per week for the last month
+  one per month for the last year
+  one per year before that
+
+Keep (10)
+  2022-12-03-15.52.04    newest of year 2022
+  ...
+Remove (5)
+  2022-08-28-17.21.22    superseded by 2022-12-03-15.52.04 (year 2022)
+  ...
+
+5 of 15 snapshot(s) would be removed — nothing was deleted (listing only).
+```
+
+The policy is fixed, and measured in whole UTC calendar days so it always
+agrees with the snapshot directory names:
+
+| age | kept |
+|-----|------|
+| today | every snapshot |
+| 1–7 days | one per day |
+| 8–31 days | one per week |
+| 32–365 days | one per month |
+| older | one per year |
+
+The **newest** snapshot in each period is the one kept. The directory an
+interrupted or failed run is using is never a candidate — `bu backup-remove`
+clears that one — and the listing says so when it applies.
+
+`bu prune` reads the destination and writes nothing at all: no status file,
+no history entry, no log. It never touches the source trees, so it is safe to
+run at any time, including while a backup is in progress.
+
 ### Creating a config
 
 ```bash
@@ -364,6 +408,9 @@ bu restore photos ./restore Photos
 
 # Check the newest backup is actually readable (uses restore_test_dirs)
 bu restore-test photos
+
+# See which snapshots a retention policy would drop (deletes nothing)
+bu prune notes
 
 # snapshot destinations restore from the newest snapshot by default;
 # a timestamp PATH picks an older one

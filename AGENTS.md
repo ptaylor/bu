@@ -12,8 +12,8 @@ bu ACTION NAME [ARGS...]
 ```
 
 - `ACTION` is one of: `backup`, `backup-restart`, `backup-remove`,
-  `backup-dry-run`, `restore`, `restore-test`, `status`, `list`, `config`, `delete`,
-  `history`, `log`, `encrypt`, `create`, `help`.
+  `backup-dry-run`, `restore`, `restore-test`, `prune`, `status`, `list`, `config`,
+  `delete`, `history`, `log`, `encrypt`, `create`, `help`.
 - `NAME` is a named destination that exists as a `.toml` config file
   (except `list`, `encrypt`, `create`, and bare `config`, which take no
   name).
@@ -223,6 +223,17 @@ bu ACTION NAME [ARGS...]
   Restore defaults to the latest snapshot; a PATH whose first component is
   a timestamp selects that snapshot.  Restore never deletes.
 - `bu status` lists ALL snapshots (oldest→newest, latest marked).
+- `bu prune NAME` is **snapshot-only and lists only** — it deletes nothing and
+  writes nothing (no status file, history or log), so it is safe mid-run.
+  Policy, hard-coded in `SnapshotMethod.prune_policy()`: keep every snapshot from
+  today, one per day for 7 days, one per ISO week to 31 days, one per calendar
+  month to 365 days, one per calendar year beyond that.  Buckets are UTC
+  calendar-based (`_bucket_for`), the **newest** snapshot in each bucket wins,
+  and the status file's `snapshot` directory (an interrupted or failed run) is
+  never a candidate — `bu backup-remove` owns that.  Ages are whole UTC calendar
+  days; `prune_plan(now=...)` takes an injectable clock so tests need no patching.
+  Do not "finish" this by adding a delete: the list-only behaviour is the
+  deliberate first version.
 
 ### duplicity (`src/bu/backends/duplicity.py`)
 
