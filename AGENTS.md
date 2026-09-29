@@ -156,7 +156,13 @@ bu ACTION NAME [ARGS...]
   `tempfile.mkdtemp()` directory, compares the last non-blank line to `run_id`,
   always removes the temp tree, and exits 1 on any failure.  Snapshot prefixes
   the status's snapshot name, so the recorded snapshot is verified rather than
-  whatever is newest.  duplicity resolves its passphrase without prompting.
+  whatever is newest.  `non_interactive` means "never block on a prompt when
+  nothing can answer one", not "never prompt": duplicity still prompts on a
+  terminal (resolved once per run — `_passphrase_cache` — however many markers
+  there are), and only a run with no TTY is refused with the hint.  Without
+  that, `bu restore-test` on a duplicity destination that relies on the
+  interactive prompt (no `passphrase_file`, no `BU_PASSPHRASE`) could never
+  pass, while `bu backup` worked.
 - `bu backup-dry-run` writes no markers (it writes nothing at all), and
   `bu create` writes `restore_test_dirs` for the root of every source path.
 
@@ -250,8 +256,15 @@ bu ACTION NAME [ARGS...]
 - Passphrase resolution order (never store it in the config):
   1. `passphrase_file` key — first line of the file (perms should be 0600)
   2. `BU_PASSPHRASE` / `PASSPHRASE` environment variable
-  3. interactive `getpass` prompt (TTY only)
-  - Non-interactive contexts (status) never prompt.
+  3. interactive `getpass` prompt (TTY only — `sys.stdin.isatty()` decides)
+  - `_configured_passphrase(strict=...)` is the one lookup for steps 1-2;
+    `strict` raises on a `passphrase_file` that is missing or empty instead of
+    falling through (the config named a file, so that is a config error).
+  - The result is cached as `_passphrase_cache` for the run: `bu restore-test`
+    restores one marker per `restore()` call and must prompt only once.
+  - Contexts that never prompt (`status`, and any run without a TTY) use
+    `_non_interactive_passphrase()`, which reports a missing passphrase
+    instead.
 - B2 credentials in config:
   - plaintext `b2_account_id` / `b2_account_key`, or
   - encrypted `b2_account_id_enc` / `b2_account_key_enc` — armored GPG blobs

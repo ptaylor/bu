@@ -684,7 +684,8 @@ class Backend(ABC):
         file arrives and its newest entry is that run id.  The temporary
         directory is always removed — the findings come back in ``results``
         instead.  Destinations that need a passphrase resolve it without
-        prompting, so this is safe to run unattended.
+        prompting unless a terminal is attached, so this is safe to run
+        unattended and still asks once when a human is watching.
         """
         name = str(self.config.get("_name", "unknown"))
         status = self.read_status()

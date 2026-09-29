@@ -221,6 +221,13 @@ A pass proves the newest backup is both present and readable. The temporary
 directory is always removed, and neither the destination nor the source trees
 are modified. Nothing is checked when no `restore_test_dirs` are configured.
 
+> A `duplicity` destination needs its archive passphrase to read anything
+> back. `bu restore-test` uses `passphrase_file` or `BU_PASSPHRASE` /
+> `PASSPHRASE` when they are set, and otherwise prompts on the terminal — once
+> for the whole run, not once per marker. Run unattended with neither a stored
+> passphrase nor a terminal, it reports the missing passphrase and fails
+> instead of blocking.
+
 > A marker at the **root** of a source is let through that source's include
 > list, which would otherwise skip anything not listed — so an
 > `include-home.txt`-style list needs no marker entry. A marker in a

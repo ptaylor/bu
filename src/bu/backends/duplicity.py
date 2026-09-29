@@ -9,7 +9,13 @@ Passphrase resolution order (backup and restore):
        on its first line (permissions should be 0600)
     2. ``BU_PASSPHRASE`` or ``PASSPHRASE`` environment variable
     3. Interactive prompt (getpass) — restore/backup prompt when nothing
-       else is configured
+       else is configured.  Never attempted without a terminal, so an
+       unattended run (``bu restore-test`` under cron, say) fails with a
+       hint instead of blocking on a prompt nobody can answer.
+
+Resolved passphrases are cached per backend instance, so ``bu restore-test``
+— which restores one marker file per invocation of ``restore`` — prompts
+once, not once per marker.
 
 Configuration keys:
     destination: str — base target directory for duplicity archives
@@ -246,44 +252,26 @@ class DuplicityMethod(Backend):
             return []
         return sorted(p.name for p in root.iterdir() if p.is_dir())
 
-    def _resolve_passphrase(self) -> str:
-        """Resolve the GPG passphrase from file, env, or interactive prompt."""
-        name = self.config.get("_name", "unknown")
+    def _configured_passphrase(self, *, strict: bool) -> str | None:
+        """Passphrase from ``passphrase_file``, then the environment.
 
-        # 1. passphrase_file from config
+        With ``strict`` set, a ``passphrase_file`` key that names a missing or
+        empty file raises instead of falling through to the environment: the
+        config asked for that file, so an unusable one is a configuration
+        error rather than an absent passphrase.
+        """
         pf = self.config.get("passphrase_file", "")
         if pf:
             p = Path(pf).expanduser()
             if not p.exists():
-                raise ValueError(f"Passphrase file not found: {p}")
-            lines = p.read_text().splitlines()
-            if not lines:
-                raise ValueError(f"Passphrase file is empty: {p}")
-            return lines[0].strip()
-
-        # 2. Environment variables
-        for env_var in ("BU_PASSPHRASE", "PASSPHRASE"):
-            if val := os.environ.get(env_var):
-                return val
-
-        # 3. Interactive prompt
-        if not sys.stdin.isatty():
-            raise ValueError(
-                f"No passphrase configured for {name!r}: set 'passphrase_file' "
-                "in the config or run interactively to be prompted."
-            )
-        return getpass.getpass(f"GPG passphrase for '{name}': ")
-
-    def _non_interactive_passphrase(self) -> str | None:
-        """Resolve passphrase from file or env only — never prompts."""
-        # passphrase_file from config
-        pf = self.config.get("passphrase_file", "")
-        if pf:
-            p = Path(pf).expanduser()
-            if p.exists():
+                if strict:
+                    raise ValueError(f"Passphrase file not found: {p}")
+            else:
                 lines = p.read_text().splitlines()
-                if lines:
+                if lines and lines[0].strip():
                     return lines[0].strip()
+                if strict:
+                    raise ValueError(f"Passphrase file is empty: {p}")
 
         # Environment variables
         for env_var in ("BU_PASSPHRASE", "PASSPHRASE"):
@@ -291,6 +279,41 @@ class DuplicityMethod(Backend):
                 return val
 
         return None
+
+    def _resolve_passphrase(self) -> str:
+        """Resolve the GPG passphrase: file, env, then an interactive prompt.
+
+        The result is cached for the rest of the run, so a run that restores
+        several files (``bu restore-test`` restores one marker at a time)
+        prompts at most once.
+        """
+        cached = getattr(self, "_passphrase_cache", None)
+        if cached:
+            return cached
+
+        passphrase = self._configured_passphrase(strict=True)
+        if not passphrase:
+            name = self.config.get("_name", "unknown")
+            # Only ever prompt on a terminal: an unattended run fails with a
+            # hint instead of blocking forever on a prompt nobody can see.
+            if not sys.stdin.isatty():
+                raise ValueError(
+                    f"No passphrase configured for {name!r}: set 'passphrase_file' "
+                    "in the config or run interactively to be prompted."
+                )
+            passphrase = getpass.getpass(f"GPG passphrase for '{name}': ")
+        self._passphrase_cache = passphrase
+        return passphrase
+
+    def _non_interactive_passphrase(self) -> str | None:
+        """Resolve passphrase from file or env only — never prompts."""
+        cached = getattr(self, "_passphrase_cache", None)
+        if cached:
+            return cached
+        passphrase = self._configured_passphrase(strict=False)
+        if passphrase:
+            self._passphrase_cache = passphrase
+        return passphrase
 
     def _b2_credentials(self) -> tuple[str, str] | None:
         """Resolve Backblaze B2 credentials, or None when not configured.
@@ -845,11 +868,18 @@ class DuplicityMethod(Backend):
         if errors:
             return {"files_restored": 0, "bytes_restored": 0, "errors": errors}
 
-        # Restore always needs the passphrase.  ``bu restore-test`` asks for
-        # the non-interactive resolution so an unattended run can never block
-        # on a prompt.
+        # Restore always needs the passphrase.  ``bu restore-test`` restores
+        # read-only marker files, so it never blocks on a prompt when nothing
+        # is attached to answer one — but it does prompt on a terminal, just
+        # like ``bu backup`` and ``bu restore``: an interactive restore test
+        # used to fail outright unless the passphrase happened to be in a
+        # file or the environment.
         try:
-            if extra_args and extra_args.get("non_interactive"):
+            if (
+                extra_args
+                and extra_args.get("non_interactive")
+                and not sys.stdin.isatty()
+            ):
                 passphrase = self._non_interactive_passphrase()
                 if not passphrase:
                     name = self.config.get("_name", "unknown")
@@ -859,8 +889,9 @@ class DuplicityMethod(Backend):
                         "errors": [
                             (
                                 f"No passphrase available for {name!r}: set "
-                                "'passphrase_file' in the config or BU_PASSPHRASE "
-                                "in the environment."
+                                "'passphrase_file' in the config, BU_PASSPHRASE in "
+                                "the environment, or run from a terminal to be "
+                                "prompted."
                             )
                         ],
                     }

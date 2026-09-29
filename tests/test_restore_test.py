@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from bu.actions import _build_backend, action_restore_test, format_restore_test
+from bu.backends import duplicity
 from bu.backends.base import on_disk_path
+from bu.backends.duplicity import DuplicityMethod
 from bu.backends.local import RsyncMethod
 from bu.backends.snapshot import SnapshotMethod
 from bu.config import Config, DestinationConfig
@@ -474,3 +478,179 @@ def test_wizard_lists_each_source_root(
     # Validation is clean: every entry sits inside a source tree and reaches
     # the backup, so `bu status`/`bu backup` have nothing to warn about.
     assert _build_backend(cfg).restore_test_notes() == []
+
+
+# ---------------------------------------------------------------------------
+# duplicity: the passphrase a restore test needs
+# ---------------------------------------------------------------------------
+
+RUN_ID = "2026-09-28T19:47:13.059023+00:00"
+MARKER = "backup-status-b2.txt"
+
+
+class Tty(io.StringIO):
+    """A stdin stand-in that claims to be a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _duplicity_stub(env: Path, run_id: str) -> Path:
+    """Write a fake duplicity that fabricates the restored marker file.
+
+    ``duplicity restore --path-to-restore=<file> <target>`` writes the file
+    *at* ``target``, replacing the placeholder directory bu creates there, so
+    the stub does the same.  (Verified against duplicity 3.1.0.)
+    """
+    directory = env / "bin"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "duplicity"
+    path.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo "duplicity 3.1.0"; exit 0; fi\n'
+        # The target is the last argument.
+        'target=""\n'
+        'for a in "$@"; do target="$a"; done\n'
+        '[ -d "$target" ] && rmdir "$target"\n'
+        f'printf "%s\\n" "{run_id}" > "$target"\n'
+    )
+    os.chmod(path, 0o755)
+    return path
+
+
+def make_duplicity(
+    env: Path,
+    sources: list[Path],
+    *,
+    name: str = "b2",
+    passphrase_file: Path | None = None,
+) -> DuplicityMethod:
+    """A duplicity backend with one restore marker per source."""
+    config: dict = {
+        "destination": str(env / "dest"),
+        "_name": name,
+        "_source_paths": [str(s) for s in sources],
+        "_exclude_files": [],
+        "_source_includes": [[] for _ in sources],
+        "_source_excludes": [None for _ in sources],
+        "_restore_test_dirs": [str(s) for s in sources],
+    }
+    if passphrase_file is not None:
+        config["passphrase_file"] = str(passphrase_file)
+    return DuplicityMethod(config)
+
+
+def record_run(
+    method: DuplicityMethod, sources: list[Path], run_id: str = RUN_ID,
+) -> None:
+    """Record a completed run the way `bu backup` would."""
+    method._write_status(
+        "completed",
+        run_id=run_id,
+        restore_test=[
+            {
+                "dir": str(s),
+                "source": str(s.resolve()),
+                "source_subdir": s.name,
+                "rel_dir": "",
+                "marker_file": MARKER,
+                "run_id": run_id,
+            }
+            for s in sources
+        ],
+    )
+
+
+def test_duplicity_restore_test_prompts_once_on_a_terminal(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interactive restore-test asks for the passphrase instead of failing.
+
+    Regression: the passphrase was resolved non-interactively even on a
+    terminal, so `bu restore-test` failed unless the passphrase happened to be
+    in `passphrase_file` or the environment — even though `bu backup` prompts.
+    """
+    sources = []
+    for label in ("paul", "Dropbox", "GoogleDrive"):
+        source = env / label
+        source.mkdir()
+        sources.append(source)
+    _duplicity_stub(env, RUN_ID)
+    monkeypatch.setenv("PATH", f"{env / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("BU_PASSPHRASE", raising=False)
+    monkeypatch.delenv("PASSPHRASE", raising=False)
+    monkeypatch.setattr(sys, "stdin", Tty())
+
+    prompts: list[str] = []
+
+    def fake_getpass(prompt: str) -> str:
+        prompts.append(prompt)
+        return "hunter2"
+
+    monkeypatch.setattr(duplicity, "getpass", SimpleNamespace(getpass=fake_getpass))
+
+    method = make_duplicity(env, sources)
+    record_run(method, sources)
+
+    result = method.restore_test()
+    assert result["ok"], result["errors"]
+    assert (result["checked"], result["passed"], result["failed"]) == (3, 3, 0)
+    # One prompt for three markers: the passphrase is cached for the run.
+    assert prompts == ["GPG passphrase for 'b2': "]
+
+
+def test_duplicity_restore_test_never_prompts_without_a_terminal(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unattended restore test fails with a hint rather than blocking."""
+    source = env / "src"
+    source.mkdir()
+    _duplicity_stub(env, RUN_ID)
+    monkeypatch.setenv("PATH", f"{env / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("BU_PASSPHRASE", raising=False)
+    monkeypatch.delenv("PASSPHRASE", raising=False)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        duplicity, "getpass",
+        SimpleNamespace(getpass=lambda prompt: prompts.append(prompt) or "x"),
+    )
+
+    method = make_duplicity(env, [source])
+    record_run(method, [source])
+
+    result = method.restore_test()
+    assert result["ok"] is False
+    assert "No passphrase available for 'b2'" in result["errors"][0]
+    assert "run from a terminal to be prompted" in result["errors"][0]
+    assert prompts == []
+
+
+def test_duplicity_restore_test_uses_a_passphrase_file(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`passphrase_file` keeps the restore test unattended and prompt-free."""
+    source = env / "src"
+    source.mkdir()
+    _duplicity_stub(env, RUN_ID)
+    monkeypatch.setenv("PATH", f"{env / 'bin'}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("BU_PASSPHRASE", raising=False)
+    monkeypatch.delenv("PASSPHRASE", raising=False)
+    monkeypatch.setattr(sys, "stdin", io.StringIO())
+
+    passphrase_file = env / "b2.pass"
+    passphrase_file.write_text("hunter2\n")
+
+    prompts: list[str] = []
+    monkeypatch.setattr(
+        duplicity, "getpass",
+        SimpleNamespace(getpass=lambda prompt: prompts.append(prompt) or "x"),
+    )
+
+    method = make_duplicity(env, [source], passphrase_file=passphrase_file)
+    record_run(method, [source])
+
+    result = method.restore_test()
+    assert result["ok"], result["errors"]
+    assert prompts == []
