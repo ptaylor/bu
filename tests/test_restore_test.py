@@ -11,13 +11,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
-from bu.actions import _build_backend, action_restore_test, format_restore_test
+from bu.actions import (
+    _build_backend,
+    action_restore_test,
+    format_restore_test,
+    format_restore_test_path,
+)
 from bu.backends import duplicity
 from bu.backends.base import on_disk_path
 from bu.backends.duplicity import DuplicityMethod
 from bu.backends.local import RsyncMethod
 from bu.backends.snapshot import SnapshotMethod
+from bu.cli import main
 from bu.config import Config, DestinationConfig
 from bu.filters import last_entry, pattern_matches
 
@@ -654,3 +661,225 @@ def test_duplicity_restore_test_uses_a_passphrase_file(
     result = method.restore_test()
     assert result["ok"], result["errors"]
     assert prompts == []
+
+
+# ---------------------------------------------------------------------------
+# restore-test PATH — restore one backup path and prove it matches the source
+# ---------------------------------------------------------------------------
+
+
+def test_path_restore_test_matches_source_file(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    result = m.restore_test_path("src/sub/b.txt")
+    assert result["ok"], result["errors"]
+    assert result["kind"] == "file"
+    assert result["source_path"] == str((src / "sub" / "b.txt").resolve())
+    row = result["files"][0]
+    assert row["state"] == "match"
+    assert row["source_size"] == row["restored_size"] == 2  # "b\n"
+    assert row["source_sha256"] == row["restored_sha256"]
+
+    output = format_restore_test_path(result, colour=False)
+    assert "match" in output
+    assert "sha256" in output
+    assert row["source_sha256"] in output
+
+
+def test_path_restore_test_detects_a_modified_source(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    (src / "sub" / "b.txt").write_text("changed after backup\n")
+    result = m.restore_test_path("src/sub/b.txt")
+    assert result["ok"] is False
+    assert result["files_differed"] == 1
+    assert result["files"][0]["state"] == "differ"
+
+    output = format_restore_test_path(result, colour=False)
+    assert "differ" in output
+    assert "changed since the backup" in output
+
+
+def test_path_restore_test_reports_a_deleted_source(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    (src / "sub" / "b.txt").unlink()
+    result = m.restore_test_path("src/sub/b.txt")
+    # The backup copy is intact — only the source moved on.
+    assert result["ok"] is True
+    assert result["files"][0]["state"] == "only_in_backup"
+
+    output = format_restore_test_path(result, colour=False)
+    assert "no longer has this file" in output
+    assert "restored and intact" in output
+
+
+def test_path_restore_test_compares_a_directory(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    (src / "sub" / "b.txt").write_text("changed\n")
+    (src / "sub" / "new.txt").write_text("new\n")
+
+    result = m.restore_test_path("src")
+    assert result["kind"] == "directory"
+    assert result["files_differed"] == 1
+    assert result["files_only_in_source"] == 1
+    assert result["ok"] is False
+
+    output = format_restore_test_path(result, colour=False)
+    assert "1 differ" in output
+    assert "1 added since the backup" in output
+
+
+def test_path_restore_test_unknown_source(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    result = m.restore_test_path("nope/file.txt")
+    assert result["ok"] is False
+    assert "does not name a source" in result["errors"][0]
+
+
+def test_path_restore_test_temporary_directory_is_removed(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_rsync(dest, [src], restore_dirs=[src])
+    m.backup([str(src)], scroll_lines=0)
+
+    created: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def recording_mkdtemp(*args: object, **kwargs: object) -> str:
+        path = real_mkdtemp(*args, **kwargs)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", recording_mkdtemp)
+
+    assert m.restore_test_path("src/sub/b.txt")["ok"]
+    assert created and not Path(created[0]).exists()
+
+
+def test_path_restore_test_snapshot_timestamp_prefix(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    m = make_method(SnapshotMethod, dest, [src], restore_dirs=[src])
+    first = m.backup([str(src)], scroll_lines=0)
+    snap = first["snapshot"]
+
+    result = m.restore_test_path(f"{snap}/src/sub/b.txt")
+    assert result["ok"], result["errors"]
+    assert result["snapshot"] == snap
+    assert result["files"][0]["state"] == "match"
+
+
+def test_cli_restore_test_path_matches(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    cfg_dir = env / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "t.toml").write_text(
+        f'method = "rsync"\n'
+        f'source_paths = ["{src}"]\n'
+        f'destination = "{dest}"\n'
+    )
+
+    # Seed a completed backup through the backend directly.
+    cfg = Config(cfg_dir).get("t")
+    _build_backend(cfg).backup([str(src)], scroll_lines=0)
+
+    result = CliRunner().invoke(main, ["restore-test", "t", "src/sub/b.txt"])
+    assert result.exit_code == 0, result.output
+    assert "match" in result.output
+    assert "sha256" in result.output
+
+
+def test_cli_restore_test_path_reports_differences(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    cfg_dir = env / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "t.toml").write_text(
+        f'method = "rsync"\n'
+        f'source_paths = ["{src}"]\n'
+        f'destination = "{dest}"\n'
+    )
+
+    cfg = Config(cfg_dir).get("t")
+    _build_backend(cfg).backup([str(src)], scroll_lines=0)
+    (src / "sub" / "b.txt").write_text("changed\n")
+
+    result = CliRunner().invoke(main, ["restore-test", "t", "src/sub/b.txt"])
+    assert result.exit_code == 1, result.output
+    assert "differ" in result.output
+    assert "changed since the backup" in result.output
+
+
+def test_cli_restore_test_without_a_path_is_unchanged(env: Path) -> None:
+    src = _source(env)
+    dest = env / "dest"
+    dest.mkdir()
+    cfg_dir = env / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "t.toml").write_text(
+        f'method = "rsync"\n'
+        f'source_paths = ["{src}"]\n'
+        f'destination = "{dest}"\n'
+        f'restore_test_dirs = ["{src}"]\n'
+    )
+
+    cfg = Config(cfg_dir).get("t")
+    _build_backend(cfg).backup([str(src)], scroll_lines=0)
+
+    result = CliRunner().invoke(main, ["restore-test", "t"])
+    assert result.exit_code == 0, result.output
+    assert "marker(s) verified" in result.output
+
+
+def test_duplicity_path_restore_test_knows_its_method(
+    env: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """restore-test PATH works for duplicity (regression: missing METHOD_NAME).
+
+    DuplicityMethod never declared ``METHOD_NAME`` — ``bu restore-test`` with a
+    PATH crashed with ``AttributeError`` before even reaching the restore, so
+    the method name is a hard requirement of the shared comparison code.
+    """
+    source = env / "src"
+    (source / "sub").mkdir(parents=True)
+    (source / "sub" / "b.txt").write_text("b\n")
+    method = make_duplicity(env, [source])
+
+    monkeypatch.setattr(
+        method, "restore",
+        lambda *a, **kw: {"files_restored": 0, "bytes_restored": 0, "errors": ["stub"]},
+    )
+
+    result = method.restore_test_path("src/sub/b.txt")
+    assert result["method"] == "duplicity"
+    assert result["errors"] == ["stub"]

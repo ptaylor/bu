@@ -36,7 +36,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import quote
 
 from bu.backends.base import Backend, LiveWindow, run_filtered, run_streaming
@@ -177,6 +177,9 @@ def _selecting_handler(
 
 class DuplicityMethod(Backend):
     """Back up using the duplicity CLI with symmetric GPG encryption."""
+
+    # Method name recorded in status files and reports.
+    METHOD_NAME: ClassVar[str] = "duplicity"
 
     # ------------------------------------------------------------------
     # helpers

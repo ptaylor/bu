@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,46 @@ try:  # POSIX only — bu targets macOS and Linux
     import resource as _resource
 except ImportError:  # pragma: no cover - non-POSIX platforms
     _resource = None  # type: ignore[assignment]
+
+try:  # POSIX only — used for the ls-style owner/group names
+    import grp as _grp
+    import pwd as _pwd
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    _grp = None  # type: ignore[assignment]
+    _pwd = None  # type: ignore[assignment]
+
+
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 hex digest of a file's contents."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ls_style_line(path: Path) -> str:
+    """A single ``ls -l``-style line for ``path`` (mode, size, mtime, name)."""
+    st = path.stat()
+    mode = stat.filemode(st.st_mode)
+    try:
+        owner = _pwd.getpwuid(st.st_uid).pw_name if _pwd else str(st.st_uid)
+    except KeyError:  # pragma: no cover - uid not in the passwd db
+        owner = str(st.st_uid)
+    try:
+        group = _grp.getgrgid(st.st_gid).gr_name if _grp else str(st.st_gid)
+    except KeyError:  # pragma: no cover - gid not in the group db
+        group = str(st.st_gid)
+    stamp = datetime.datetime.fromtimestamp(
+        st.st_mtime, tz=datetime.timezone.utc,
+    ).astimezone()
+    if time.time() - st.st_mtime > 180 * 24 * 3600:
+        when = stamp.strftime("%b %e  %Y")
+    else:
+        when = stamp.strftime("%b %e %H:%M")
+    return (
+        f"{mode} {st.st_nlink:>3} {owner} {group} {st.st_size:>9} {when} {path.name}"
+    )
 
 # ANSI CSI escape sequences (e.g. colours, cursor movement) stripped from rows.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -783,6 +825,226 @@ class Backend(ABC):
                 f"last entry {actual or '(empty)'} does not match the run id {expected}"
             )
         return outcome
+
+    def _source_for_backup_path(
+        self, path_within_backup: str,
+    ) -> tuple[int, Path, str, str] | None:
+        """Map a backup-relative path back to ``(index, source_path, rel, subdir)``.
+
+        The first component (after an optional snapshot timestamp) names the
+        source archive subdirectory; the remainder is the path within that
+        source.  Returns ``None`` when the path does not name a known archive.
+        """
+        parts = list(Path(path_within_backup).parts)
+        snap_re = getattr(self, "SNAPSHOT_RE", None)
+        if parts and snap_re is not None and snap_re.match(parts[0]):
+            parts = parts[1:]
+        if not parts:
+            return None
+        source_paths = self.config.get("_source_paths", [])
+        subdirs = self._source_subdirs(source_paths)
+        for idx, sub in subdirs.items():
+            if sub == parts[0]:
+                root = Path(source_paths[idx]).expanduser().resolve()
+                rel = "/".join(parts[1:])
+                return idx, root / rel if rel else root, rel, sub
+        return None
+
+    def restore_test_path(
+        self, path_within_backup: str, *, scroll_lines: int = 0,
+    ) -> dict[str, Any]:
+        """Restore one backup path and prove it matches the source file/dir.
+
+        ``path_within_backup`` is the same argument ``bu restore`` takes (a
+        path inside the backup).  It is restored into a private temporary
+        directory and every file is compared with the file it came from in the
+        source tree: the two ``ls -l`` lines, sizes and SHA-256 digests are
+        reported, so a pass is proof that the backup copy still reads back
+        byte-for-byte identical to the source.  When the source has moved on —
+        changed, deleted, or with new files added since the backup — the
+        mismatch is reported as information about the *source*, never as a
+        corrupt backup.  The temporary directory is always removed.
+        """
+        name = str(self.config.get("_name", "unknown"))
+        result: dict[str, Any] = {
+            "ok": True,
+            "kind": "file",
+            "name": name,
+            "method": self.METHOD_NAME,
+            "path_within_backup": path_within_backup,
+            "source_path": None,
+            "snapshot": None,
+            "files": [],
+            "files_compared": 0,
+            "files_matched": 0,
+            "files_differed": 0,
+            "files_only_in_backup": 0,
+            "files_only_in_source": 0,
+            "source_missing": False,
+            "errors": [],
+        }
+
+        mapped = self._source_for_backup_path(path_within_backup)
+        if mapped is None:
+            subdirs = sorted(
+                self._source_subdirs(self.config.get("_source_paths", [])).values()
+            )
+            result["ok"] = False
+            result["errors"].append(
+                f"Backup path {path_within_backup!r} does not name a source in "
+                f"{name!r}. The first component must be one of: "
+                f"{', '.join(subdirs) or '(none)'}."
+            )
+            return result
+
+        _, source_path, rel, subdir = mapped
+        result["source_path"] = str(source_path)
+
+        snap_re = getattr(self, "SNAPSHOT_RE", None)
+        head = Path(path_within_backup).parts[0] if Path(path_within_backup).parts else ""
+        if snap_re is not None and head and snap_re.match(head):
+            result["snapshot"] = head
+
+        # Every backend's restore() places the restored content at
+        # <scratch>/<final component>, whether a file or a directory.
+        final_name = Path(rel).name if rel else subdir
+
+        scratch = Path(tempfile.mkdtemp(prefix=f"bu-restore-test-{name}-"))
+        try:
+            restore_dir = scratch / "restored"
+            restore_dir.mkdir(parents=True, exist_ok=True)
+            restored = self.restore(
+                str(restore_dir),
+                path_within_backup,
+                extra_args={"non_interactive": True, "quiet": True},
+            )
+            if restore_errors := restored.get("errors"):
+                result["ok"] = False
+                result["errors"].extend(str(e) for e in restore_errors)
+                return result
+
+            restored_target = restore_dir / final_name
+            result["source_missing"] = not source_path.exists()
+
+            rows = self._compare_restored_paths(source_path, restored_target)
+            result["files"] = rows
+            result["files_compared"] = sum(
+                1 for r in rows if r["state"] in ("match", "differ")
+            )
+            result["files_matched"] = sum(1 for r in rows if r["state"] == "match")
+            result["files_differed"] = sum(1 for r in rows if r["state"] == "differ")
+            result["files_only_in_backup"] = sum(
+                1 for r in rows if r["state"] == "only_in_backup"
+            )
+            result["files_only_in_source"] = sum(
+                1 for r in rows if r["state"] == "only_in_source"
+            )
+            result["kind"] = "file" if restored_target.is_file() else "directory"
+            # A mismatch is drift in the source since the backup, not a broken
+            # backup — but it is still reported as a failed comparison so
+            # scripts can catch it.
+            result["ok"] = result["files_differed"] == 0
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return result
+
+    def _compare_restored_paths(
+        self, source_path: Path, restored_path: Path,
+    ) -> list[dict[str, Any]]:
+        """Compare a restored backup path with its source counterpart.
+
+        Returns one row per file.  A single file yields one row; a directory
+        is walked on both sides and compared recursively, so additions and
+        deletions in the source since the backup show up as their own rows.
+        """
+        if restored_path.is_file() or source_path.is_file():
+            return [self._compare_file(source_path.name, source_path, restored_path)]
+
+        source_files = self._walk_files(source_path)
+        restored_files = self._walk_files(restored_path)
+        rows: list[dict[str, Any]] = []
+        for rel in sorted(set(source_files) | set(restored_files)):
+            rows.append(self._compare_file(
+                rel, source_files.get(rel), restored_files.get(rel),
+            ))
+        return rows
+
+    def _walk_files(self, root: Path) -> dict[str, Path]:
+        """Map relative path -> absolute path for every file under ``root``."""
+        if not root.exists():
+            return {}
+        if root.is_file():
+            return {root.name: root}
+        found: dict[str, Path] = {}
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                found[str(path.relative_to(root))] = path
+        return found
+
+    def _compare_file(
+        self, rel: str, source_file: Path | None, restored_file: Path | None,
+    ) -> dict[str, Any]:
+        """Compare one file from the backup with its source counterpart."""
+        row: dict[str, Any] = {
+            "rel": rel,
+            "state": "match",
+            "source": str(source_file) if source_file else None,
+            "restored": str(restored_file) if restored_file else None,
+            "source_size": None,
+            "restored_size": None,
+            "source_sha256": None,
+            "restored_sha256": None,
+            "source_ls": None,
+            "restored_ls": None,
+        }
+        source_exists = source_file is not None and source_file.exists()
+        restored_exists = restored_file is not None and restored_file.exists()
+
+        if source_exists and restored_exists:
+            if not source_file.is_file() or not restored_file.is_file():
+                # One side is a file and the other a directory (or similar):
+                # the path changed type since the backup.
+                if source_file.is_file():
+                    row["source_size"] = source_file.stat().st_size
+                    row["source_ls"] = ls_style_line(source_file)
+                if restored_file.is_file():
+                    row["restored_size"] = restored_file.stat().st_size
+                    row["restored_ls"] = ls_style_line(restored_file)
+                row["state"] = "differ"
+                return row
+            row["source_size"] = source_file.stat().st_size
+            row["restored_size"] = restored_file.stat().st_size
+            row["source_sha256"] = sha256_file(source_file)
+            row["restored_sha256"] = sha256_file(restored_file)
+            row["source_ls"] = ls_style_line(source_file)
+            row["restored_ls"] = ls_style_line(restored_file)
+            row["state"] = (
+                "match"
+                if row["source_size"] == row["restored_size"]
+                and row["source_sha256"] == row["restored_sha256"]
+                else "differ"
+            )
+            return row
+
+        if restored_exists:
+            row["state"] = "only_in_backup"
+            if restored_file.is_file():
+                row["restored_size"] = restored_file.stat().st_size
+                row["restored_sha256"] = sha256_file(restored_file)
+                row["restored_ls"] = ls_style_line(restored_file)
+            return row
+
+        if source_exists:
+            row["state"] = "only_in_source"
+            if source_file.is_file():
+                row["source_size"] = source_file.stat().st_size
+                row["source_sha256"] = sha256_file(source_file)
+                row["source_ls"] = ls_style_line(source_file)
+            return row
+
+        # Neither side exists — the path vanished on both sides.
+        row["state"] = "differ"
+        return row
 
     def list_files(
         self,

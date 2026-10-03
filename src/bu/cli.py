@@ -9,7 +9,7 @@ Actions:
     backup-remove   Remove an incomplete snapshot backup directory
     backup-dry-run  List the files the next backup would consider (no writes)
     restore   Restore files into a local directory (never deletes)
-    restore-test  Restore the last backup's marker files and verify them
+    restore-test  Verify the newest backup is restorable (or compare one path)
     prune     List the snapshots a retention policy would remove (no deletes)
     status    Show status and last backup details
     list      List all configured destinations
@@ -44,6 +44,7 @@ from bu.actions import (
     format_history,
     format_prune,
     format_restore_test,
+    format_restore_test_path,
     format_result,
     format_status,
 )
@@ -257,22 +258,33 @@ def restore(
 
 @_command("restore-test")
 @_NAME_ARG
-def restore_test(name: str) -> None:
-    """Check that NAME's newest backup can actually be restored.
+@click.argument("path_within_backup", metavar="[PATH]", required=False, default=None)
+def restore_test(name: str, path_within_backup: str | None) -> None:
+    """Verify NAME's newest backup is restorable, or compare one path.
 
-    Before every backup bu appends a run identifier to
+    Without PATH: before every backup bu appends a run identifier to
     'backup-status-<name>.txt' in each configured restore_test_dirs directory.
-    This restores those files from the newest backup into a temporary
-    directory and checks their newest entry names the run that just completed,
-    so a pass proves the data is both present and readable. Read-only: the
-    destination and the source trees are never modified, and the temporary
-    directory is always removed. Refuses while the last backup is not
-    completed.
+    Those files are restored from the newest backup into a temporary directory
+    and their newest entry must name the run that just completed, so a pass
+    proves the data is both present and readable.
+
+    With PATH (a path inside the backup, as 'bu restore' takes it): the path
+    is restored into a temporary directory and compared with the matching
+    source file/directory — the two ls -l lines, sizes and SHA-256 digests are
+    shown, so a pass proves the backup copy still matches the source.  A source
+    changed since the backup is reported as such.
+
+    Read-only: the destination and the source trees are never modified, and the
+    temporary directory is always removed.  Refuses while the last backup is
+    not completed.
     """
     dest_cfg = _resolve_destination(name)
 
-    result = action_restore_test(dest_cfg)
-    click.echo(format_restore_test(result))
+    result = action_restore_test(dest_cfg, path_within_backup)
+    if path_within_backup:
+        click.echo(format_restore_test_path(result))
+    else:
+        click.echo(format_restore_test(result))
 
     if not result.get("ok"):
         sys.exit(1)

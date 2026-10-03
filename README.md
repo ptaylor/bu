@@ -28,7 +28,7 @@ Commands take positional arguments only — no flags to remember. Use `bu help`
 | `bu backup-remove NAME` | Remove an incomplete snapshot directory (snapshot only; refuses when the last run completed; asks for confirmation) |
 | `bu backup-dry-run NAME` | List the files the next backup would consider, writing nothing. Paths stream to stdout as they are found; the filters in effect and the totals go to stderr |
 | `bu restore NAME RESTORE_DIR [PATH]` | Restore files into a local directory (never deletes; refuses while the last backup is not `completed`) |
-| `bu restore-test NAME` | Restore the last backup's marker files into a temporary directory and verify them — proves the backup is readable. Read-only; refuses while the last backup is not `completed` |
+| `bu restore-test NAME [PATH]` | Verify the newest backup is restorable. Without `PATH`, restores the last backup's marker files into a temporary directory and checks them — proves the backup is readable. With `PATH` (a path inside the backup, as `bu restore` takes it), restores that path and compares it byte-for-byte with the source: `ls -l` lines, sizes and SHA-256 digests are shown. Read-only; refuses while the last backup is not `completed` |
 | `bu prune NAME` | List the snapshots a retention policy would remove (snapshot only). **Lists only — deletes nothing** |
 | `bu status NAME` | Show config, destination state, and last backup details |
 | `bu list` | List all configured destinations |
@@ -246,6 +246,50 @@ are modified. Nothing is checked when no `restore_test_dirs` are configured.
 > When a source is cloud-synced (Dropbox, Google Drive) the marker file is
 > uploaded like any other file and appears on your other devices. It is a few
 > dozen bytes plus one line per backup.
+
+### Comparing one path against the source
+
+`bu restore-test NAME PATH` proves a specific file (or directory) still reads
+back correctly, and that it matches what is on disk now. `PATH` is a path
+inside the backup, exactly as `bu restore` takes it — the source's archive
+subdirectory first, then the path within it:
+
+```bash
+bu restore-test photos Photos/2026/trip/img_1234.jpg
+```
+
+bu restores that path into a temporary directory, then compares it with the
+file it came from in the source tree, and shows the `ls -l`-style lines, the
+sizes and the SHA-256 digests of **both** copies side by side:
+
+```
+Verify backup path 'Photos/2026/trip/img_1234.jpg' against the source
+
+  destination : photos (snapshot)
+  snapshot    : 2026-09-27-18.04.56
+  backup path : Photos/2026/trip/img_1234.jpg
+  source path : /Users/paul/Pictures/2026/trip/img_1234.jpg
+
+  file      img_1234.jpg
+  source    -rw-r--r--   1 paul staff   5124096 Sep 27 18:04 img_1234.jpg
+  restored  -rw-r--r--   1 paul staff   5124096 Sep 27 18:04 img_1234.jpg
+
+  size      5124096 bytes (restored) == 5124096 bytes (source)
+  sha256
+    restored  a3f1c0…f29e
+    source    a3f1c0…f29e
+
+  ✓ match — size and SHA-256 agree; the backup copy equals the source.
+
+✓ backup copy of 'Photos/2026/trip/img_1234.jpg' matches the source.
+```
+
+If the source file has changed since the backup, the sizes or digests differ
+and bu says so — the backup copy is still intact, it is the *source* that has
+moved on. A file deleted from the source, or added since the backup, is
+reported the same way. For a directory, bu compares every file recursively
+and lists only the differences. The temporary directory is always removed,
+and nothing in the source or the destination is modified.
 
 ### Pruning snapshots
 

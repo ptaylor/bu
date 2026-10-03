@@ -407,26 +407,50 @@ def action_backup_remove_confirmed(dest: DestinationConfig) -> dict[str, Any]:
     return backend.remove_incomplete_snapshot()
 
 
-def action_restore_test(dest: DestinationConfig) -> dict[str, Any]:
-    """Restore the last run's marker files and verify their newest entry.
+def action_restore_test(
+    dest: DestinationConfig,
+    path_within_backup: str | None = None,
+) -> dict[str, Any]:
+    """Verify the last backup — its marker files, or one path within it.
 
-    A read-only end-to-end check: the marker files written before the last
-    backup are restored into a temporary directory and their newest entry must
-    name the run that just completed — so the files really are inside the
-    backup and hold fresh data.  The temporary directory is always removed.
+    With no path, restores the marker files written before the last backup and
+    checks their newest entry names the run that just completed, so the files
+    really are inside the backup and hold fresh data.  With a path, restores
+    that single path into a temporary directory and compares it byte-for-byte
+    with the source file/directory it came from.  Both are read-only: the
+    temporary directory is always removed.
     """
     backend = _build_backend(dest)
 
     # Only a completed backup is worth verifying; a running or failed run
     # leaves the destination in an unknown state.
     if reason := backend.backup_block_reason():
+        message = "Restore test is blocked until the backup completes."
+        if path_within_backup:
+            return {
+                "ok": False,
+                "kind": "file",
+                "name": dest.name,
+                "method": dest.method,
+                "path_within_backup": path_within_backup,
+                "source_path": None,
+                "snapshot": None,
+                "files": [],
+                "files_compared": 0,
+                "files_matched": 0,
+                "files_differed": 0,
+                "files_only_in_backup": 0,
+                "files_only_in_source": 0,
+                "source_missing": False,
+                "errors": [reason, message],
+            }
         return {
             "ok": False,
             "checked": 0,
             "passed": 0,
             "failed": 0,
             "results": [],
-            "errors": [reason, "Restore test is blocked until the backup completes."],
+            "errors": [reason, message],
         }
 
     start_ts = datetime.datetime.now(datetime.timezone.utc)
@@ -437,15 +461,22 @@ def action_restore_test(dest: DestinationConfig) -> dict[str, Any]:
     _write_action_header(dest, "restore-test", start_ts)
     _touch_log_start(dest, "restore-test", start_ts)
 
-    result = backend.restore_test()
-
-    for err in result.get("errors", []):
-        logger.error(str(err))
-
-    logger.end(
-        files_restored=result.get("passed", 0),
-        markers_checked=result.get("checked", 0),
-    )
+    if path_within_backup:
+        result = backend.restore_test_path(path_within_backup)
+        for err in result.get("errors", []):
+            logger.error(str(err))
+        logger.end(
+            files_restored=result.get("files_compared", 0),
+            files_matched=result.get("files_matched", 0),
+        )
+    else:
+        result = backend.restore_test()
+        for err in result.get("errors", []):
+            logger.error(str(err))
+        logger.end(
+            files_restored=result.get("passed", 0),
+            markers_checked=result.get("checked", 0),
+        )
 
     _write_raw_log(dest, "restore-test", start_ts, result)
 
@@ -1173,11 +1204,233 @@ def format_restore_test(result: dict[str, Any], json_output: bool = False) -> st
     return "\n".join(lines)
 
 
+def format_restore_test_path(
+    result: dict[str, Any],
+    json_output: bool = False,
+    colour: bool | None = None,
+) -> str:
+    """Format a single-path restore-test comparison for display.
+
+    Shows the backup path and the source path it maps to, then the ``ls -l``
+    lines, sizes and SHA-256 digests of both copies, and a clear verdict.
+    Directories are compared recursively and only the differences are listed.
+    Colours are dropped when stdout is not a terminal; the glyphs carry the
+    same meaning either way.  ``colour`` overrides that decision.
+    """
+    if json_output:
+        return json.dumps(result, indent=2, default=str)
+
+    use_colour = sys.stdout.isatty() if colour is None else colour
+
+    path = result.get("path_within_backup", "?")
+    lines: list[str] = [f"Verify backup path {path!r} against the source", ""]
+    lines.append(
+        f"  destination : {result.get('name', '?')} ({result.get('method', '?')})"
+    )
+    if snap := result.get("snapshot"):
+        lines.append(f"  snapshot    : {snap}")
+    lines.append(f"  backup path : {path}")
+    if src := result.get("source_path"):
+        lines.append(f"  source path : {src}")
+
+    if result.get("errors"):
+        bad = _paint("✗", "bad", use_colour)
+        lines.append("")
+        for err in result["errors"]:
+            lines.append(f"  {bad} {err}")
+        lines.append("")
+        lines.append(
+            f"{bad} nothing verified — the backup path could not be restored."
+        )
+        return "\n".join(lines)
+
+    files = result.get("files", [])
+    if result.get("kind") == "file" and len(files) == 1:
+        lines.extend(_format_file_proof(files[0], use_colour))
+    else:
+        lines.extend(_format_directory_proof(result, use_colour))
+
+    lines.extend(_format_verify_verdict(result, use_colour))
+    return "\n".join(lines)
+
+
+def _format_file_proof(row: dict[str, Any], colour: bool) -> list[str]:
+    """Render the proof for a single-file comparison."""
+    ok = _paint("✓", "ok", colour)
+    bad = _paint("✗", "bad", colour)
+    gone = _paint("−", "drop", colour)
+    added = _paint("+", "accent", colour)
+
+    state = row.get("state")
+    lines: list[str] = [
+        "",
+        f"  {'file':<10}{row.get('rel', '')}",
+        f"  {'source':<10}{row.get('source_ls') or '(missing — no longer on disk)'}",
+        f"  {'restored':<10}{row.get('restored_ls') or '(not in the backup)'}",
+        "",
+    ]
+
+    src_size = row.get("source_size")
+    rst_size = row.get("restored_size")
+    src_hash = row.get("source_sha256")
+    rst_hash = row.get("restored_sha256")
+
+    def hashes() -> list[str]:
+        out = [f"  {'sha256':<10}"]
+        if rst_hash is not None:
+            out.append(f"    restored  {rst_hash}")
+        if src_hash is not None:
+            out.append(f"    source    {src_hash}")
+        return out
+
+    if state == "match":
+        lines.append(
+            f"  {'size':<10}{rst_size} bytes (restored) == {src_size} bytes (source)"
+        )
+        lines.extend(hashes())
+        lines.append("")
+        lines.append(f"  {ok} match — size and SHA-256 agree; the backup copy equals the source.")
+    elif state == "differ":
+        if src_size is None or rst_size is None:
+            lines.append(f"  {'size':<10}(type changed — file vs directory)")
+        else:
+            lines.append(
+                f"  {'size':<10}{rst_size} bytes (restored) vs {src_size} bytes (source)"
+            )
+            lines.extend(hashes())
+        lines.append("")
+        lines.append(
+            f"  {bad} differ — the source has changed since the backup "
+            "(the backup copy is intact; the source content differs)."
+        )
+    elif state == "only_in_backup":
+        lines.append(f"  {'size':<10}{rst_size} bytes")
+        lines.extend(hashes())
+        lines.append("")
+        lines.append(
+            f"  {gone} in backup only — the source no longer has this file "
+            "(deleted since the backup); the backup copy is intact."
+        )
+    elif state == "only_in_source":
+        lines.append(f"  {'size':<10}{src_size} bytes")
+        lines.extend(hashes())
+        lines.append("")
+        lines.append(
+            f"  {added} in source only — created after this backup "
+            "(not part of the backup)."
+        )
+    return lines
+
+
+def _format_directory_proof(result: dict[str, Any], colour: bool) -> list[str]:
+    """Render the summary (and differences) for a directory comparison."""
+    ok = _paint("✓", "ok", colour)
+    bad = _paint("✗", "bad", colour)
+
+    compared = result.get("files_compared", 0)
+    matched = result.get("files_matched", 0)
+    differed = result.get("files_differed", 0)
+    only_backup = result.get("files_only_in_backup", 0)
+    only_source = result.get("files_only_in_source", 0)
+
+    parts = [f"{compared} file(s) compared — {matched} match"]
+    if differed:
+        parts.append(f"{differed} differ")
+    if only_backup:
+        parts.append(f"{only_backup} deleted since the backup")
+    if only_source:
+        parts.append(f"{only_source} added since the backup")
+    lines: list[str] = ["", "  " + ", ".join(parts) + "."]
+
+    # Only the differences are listed — a matching directory would be an
+    # unreadable wall of identical lines.
+    diff_rows = [r for r in result.get("files", []) if r.get("state") != "match"]
+    if diff_rows:
+        lines.append("")
+        for shown, row in enumerate(diff_rows, start=1):
+            lines.append(_directory_diff_line(row, colour))
+            if shown >= 20 and shown < len(diff_rows):
+                lines.append(f"  … and {len(diff_rows) - shown} more difference(s)")
+                break
+
+    lines.append("")
+    if not differed:
+        lines.append(f"  {ok} all shared files match — the backup copy equals the source.")
+    else:
+        lines.append(
+            f"  {bad} some files differ — the source has changed since the backup."
+        )
+    return lines
+
+
+def _directory_diff_line(row: dict[str, Any], colour: bool) -> str:
+    """One line of a directory comparison for a file that is not a clean match."""
+    state = row.get("state")
+    rel = row.get("rel", "?")
+    if state == "differ":
+        mark = _paint("✗", "bad", colour)
+        return (
+            f"  {mark} {rel}  "
+            f"(source {row.get('source_size')} B, backup {row.get('restored_size')} B)"
+        )
+    if state == "only_in_backup":
+        mark = _paint("−", "drop", colour)
+        return f"  {mark} {rel}  (deleted from the source since the backup)"
+    if state == "only_in_source":
+        mark = _paint("+", "accent", colour)
+        return f"  {mark} {rel}  (added to the source since the backup)"
+    return f"  ? {rel}"
+
+
+def _format_verify_verdict(result: dict[str, Any], colour: bool) -> list[str]:
+    """The closing one-line verdict for a path comparison."""
+    ok = _paint("✓", "ok", colour)
+    bad = _paint("✗", "bad", colour)
+
+    path = result.get("path_within_backup", "?")
+    kind = result.get("kind", "file")
+    compared = result.get("files_compared", 0)
+    matched = result.get("files_matched", 0)
+    differed = result.get("files_differed", 0)
+    only_backup = result.get("files_only_in_backup", 0)
+    only_source = result.get("files_only_in_source", 0)
+
+    lines: list[str] = [""]
+    if result.get("ok"):
+        if kind == "file" and only_backup:
+            lines.append(
+                f"{ok} backup copy of {path!r} restored and intact "
+                "(the source file no longer exists)."
+            )
+        elif kind == "file":
+            lines.append(f"{ok} backup copy of {path!r} matches the source.")
+        else:
+            extras = []
+            if only_backup:
+                extras.append(f"{only_backup} deleted from the source since the backup")
+            if only_source:
+                extras.append(f"{only_source} added to the source since the backup")
+            suffix = f" ({'; '.join(extras)})" if extras else ""
+            lines.append(
+                f"{ok} {matched} of {compared} shared file(s) match — backup copy "
+                f"of {path!r} is consistent with the source{suffix}."
+            )
+    else:
+        lines.append(
+            f"{bad} backup copy of {path!r} differs from the source — "
+            f"{differed} of {compared} file(s) differ."
+        )
+    return lines
+
+
 # ANSI styling for the formatters — only applied when stdout is a terminal.
 _ANSI_STYLES: dict[str, str] = {
     "reset": "\033[0m",
     "keep": "\033[1;32m",    # bold green: a snapshot the policy keeps
-    "drop": "\033[2m",       # dim: a removal candidate
+    "ok": "\033[1;32m",      # bold green: a passing comparison
+    "bad": "\033[1;31m",     # bold red: a differing comparison
+    "accent": "\033[1;36m",  # bold cyan: an addition since the backup
+    "drop": "\033[2m",       # dim: a removal candidate / deletion since the backup
 }
 
 

@@ -166,6 +166,29 @@ bu ACTION NAME [ARGS...]
 - `bu backup-dry-run` writes no markers (it writes nothing at all), and
   `bu create` writes `restore_test_dirs` for the root of every source path.
 
+### Restore-test single path (`bu restore-test NAME PATH`)
+
+- `PATH` is a path inside the backup, the same argument `bu restore` takes:
+  `<source subdir>/<path within source>`.  Snapshot destinations may prefix a
+  timestamp (`2026-08-15-21.09.41/...`) to pick an older snapshot.
+- `Backend.restore_test_path()` (base.py) maps `PATH` back to its source path
+  via `_source_for_backup_path()` + `_source_subdirs()`, restores it into a
+  `tempfile.mkdtemp()` dir (`self.restore(... non_interactive, quiet)`), then
+  compares every file with `_compare_file()`: `sha256_file()` + `ls_style_line()`
+  (module-level helpers in base.py) produce the sizes, SHA-256 digests and
+  `ls -l`-style lines for **both** copies.  The temp tree is always removed.
+- Row states: `match` (identical), `differ` (source changed since the backup),
+  `only_in_backup` (deleted from the source), `only_in_source` (added since the
+  backup).  `ok` is false only when restore failed or some file `differ`s;
+  deletions/additions are informational drift, not a broken backup.
+- `format_restore_test_path()` in actions.py renders it; colour only on a TTY
+  (same `_ANSI_STYLES` machinery as prune).  Directories are compared
+  recursively and only differences are listed (capped at 20 rows).
+- Every backend must declare `METHOD_NAME` (RsyncMethod `rsync`,
+  SnapshotMethod `snapshot`, DuplicityMethod `duplicity`) — the comparison
+  result records it, and a missing one crashed `restore-test PATH` with an
+  `AttributeError` on the first duplicity run.
+
 ## Method patterns
 
 ### rsync (`src/bu/backends/local.py`)
